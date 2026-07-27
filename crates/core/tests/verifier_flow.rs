@@ -1,13 +1,15 @@
 use chrono::{Duration, Utc};
 
 use aap_core::{
-    delegation, message, ActionRequest, DelegationParams, InMemoryNonceStore, InMemoryRegistry,
-    InMemoryStatus, LocalSigner, PrincipalType, Scope, Signer, VerificationFailure, Verifier,
+    delegation, message, receipt::ReceiptOutcome, ActionRequest, DelegationParams,
+    InMemoryNonceStore, InMemoryRegistry, InMemoryStatus, LocalSigner, PrincipalType, Scope,
+    Signer, VerificationFailure, Verifier,
 };
 
 struct Fixture {
     principal_signer: LocalSigner,
     agent_signer: LocalSigner,
+    receipt_signer: LocalSigner,
     registry: InMemoryRegistry,
     status: InMemoryStatus,
     nonces: InMemoryNonceStore,
@@ -21,10 +23,24 @@ fn setup() -> Fixture {
     Fixture {
         principal_signer,
         agent_signer,
+        receipt_signer: LocalSigner::generate(),
         registry,
         status: InMemoryStatus::new(),
         nonces: InMemoryNonceStore::new(),
     }
+}
+
+fn verifier<'a>(
+    f: &'a Fixture,
+) -> Verifier<'a, InMemoryRegistry, InMemoryStatus, InMemoryNonceStore, LocalSigner> {
+    Verifier::new(
+        "verifier:bank-api",
+        "bank-api",
+        &f.registry,
+        &f.status,
+        &f.nonces,
+        &f.receipt_signer,
+    )
 }
 
 fn issue_basic_delegation(f: &Fixture, scope: Scope) -> delegation::IssuedDelegation {
@@ -82,14 +98,53 @@ fn accepts_a_valid_in_scope_request() {
     )
     .unwrap();
 
-    let verifier = Verifier::new("bank-api", &f.registry, &f.status, &f.nonces);
-    let result = verifier.verify(&[&del.jws], &msg.jws);
+    let outcome = verifier(&f).verify(&[&del.jws], &msg.jws);
 
-    assert!(result.is_ok(), "expected accept, got {:?}", result.err());
+    assert!(
+        outcome.decision.is_ok(),
+        "expected accept, got {:?}",
+        outcome.decision.err()
+    );
 }
 
 #[test]
-fn rejects_action_outside_scope() {
+fn accepted_receipt_carries_the_full_chain_and_is_verifiably_signed() {
+    let f = setup();
+    let del = issue_basic_delegation(&f, payment_scope(500.0));
+    let msg = message::issue(
+        &f.agent_signer,
+        "agent:wave-1",
+        "bank-api",
+        payment_request(100.0),
+    )
+    .unwrap();
+
+    let outcome = verifier(&f).verify(&[&del.jws], &msg.jws);
+
+    assert!(outcome.decision.is_ok());
+    assert!(matches!(
+        outcome.receipt.payload.outcome,
+        ReceiptOutcome::Accepted
+    ));
+    assert_eq!(
+        outcome.receipt.payload.delegation_ids,
+        vec![del.payload.delegation_id]
+    );
+    assert_eq!(outcome.receipt.payload.agent_id, "agent:wave-1");
+
+    // The receipt itself is a signed artifact, checkable by anyone who has
+    // the Verifier's public key — not just trusted because we were told so.
+    let receipt_key = f.receipt_signer.public_jwk();
+    let verified: aap_core::Receipt = aap_core::jws::verify(
+        &outcome.receipt.jws,
+        &aap_core::jws::jwk_to_public_key(&receipt_key).unwrap(),
+    )
+    .expect("receipt signature must verify against the receipt signer's own key");
+    assert_eq!(verified.receipt_id, outcome.receipt.payload.receipt_id);
+}
+
+#[test]
+fn rejected_request_still_produces_a_signed_receipt_with_the_reason() {
     let f = setup();
     let del = issue_basic_delegation(&f, payment_scope(500.0));
     // 1000 EUR exceeds the 500 EUR ceiling.
@@ -101,10 +156,43 @@ fn rejects_action_outside_scope() {
     )
     .unwrap();
 
-    let verifier = Verifier::new("bank-api", &f.registry, &f.status, &f.nonces);
-    let result = verifier.verify(&[&del.jws], &msg.jws);
+    let outcome = verifier(&f).verify(&[&del.jws], &msg.jws);
 
-    assert!(matches!(result, Err(VerificationFailure::ScopeDenied)));
+    assert!(matches!(
+        outcome.decision,
+        Err(VerificationFailure::ScopeDenied)
+    ));
+    match outcome.receipt.payload.outcome {
+        ReceiptOutcome::Rejected { ref reason } => {
+            assert!(reason.contains("outside the delegated scope"))
+        }
+        ReceiptOutcome::Accepted => panic!("expected a Rejected receipt"),
+    }
+    // Even on rejection, the leaf delegation could still be identified.
+    assert_eq!(
+        outcome.receipt.payload.delegation_ids,
+        vec![del.payload.delegation_id]
+    );
+}
+
+#[test]
+fn rejects_action_outside_scope() {
+    let f = setup();
+    let del = issue_basic_delegation(&f, payment_scope(500.0));
+    let msg = message::issue(
+        &f.agent_signer,
+        "agent:wave-1",
+        "bank-api",
+        payment_request(1000.0),
+    )
+    .unwrap();
+
+    let outcome = verifier(&f).verify(&[&del.jws], &msg.jws);
+
+    assert!(matches!(
+        outcome.decision,
+        Err(VerificationFailure::ScopeDenied)
+    ));
 }
 
 #[test]
@@ -120,10 +208,12 @@ fn rejects_revoked_delegation() {
     )
     .unwrap();
 
-    let verifier = Verifier::new("bank-api", &f.registry, &f.status, &f.nonces);
-    let result = verifier.verify(&[&del.jws], &msg.jws);
+    let outcome = verifier(&f).verify(&[&del.jws], &msg.jws);
 
-    assert!(matches!(result, Err(VerificationFailure::Revoked)));
+    assert!(matches!(
+        outcome.decision,
+        Err(VerificationFailure::Revoked)
+    ));
 }
 
 #[test]
@@ -139,10 +229,12 @@ fn rejects_message_signed_for_a_different_verifier() {
     )
     .unwrap();
 
-    let verifier = Verifier::new("bank-api", &f.registry, &f.status, &f.nonces);
-    let result = verifier.verify(&[&del.jws], &msg.jws);
+    let outcome = verifier(&f).verify(&[&del.jws], &msg.jws);
 
-    assert!(matches!(result, Err(VerificationFailure::AudienceMismatch)));
+    assert!(matches!(
+        outcome.decision,
+        Err(VerificationFailure::AudienceMismatch)
+    ));
 }
 
 #[test]
@@ -157,13 +249,16 @@ fn rejects_replayed_nonce() {
     )
     .unwrap();
 
-    let verifier = Verifier::new("bank-api", &f.registry, &f.status, &f.nonces);
-    let first = verifier.verify(&[&del.jws], &msg.jws);
-    assert!(first.is_ok());
+    let v = verifier(&f);
+    let first = v.verify(&[&del.jws], &msg.jws);
+    assert!(first.decision.is_ok());
 
     // Same exact signed message presented again.
-    let second = verifier.verify(&[&del.jws], &msg.jws);
-    assert!(matches!(second, Err(VerificationFailure::NonceReplayed)));
+    let second = v.verify(&[&del.jws], &msg.jws);
+    assert!(matches!(
+        second.decision,
+        Err(VerificationFailure::NonceReplayed)
+    ));
 }
 
 #[test]
@@ -196,11 +291,10 @@ fn rejects_delegation_signed_by_the_wrong_key() {
     )
     .unwrap();
 
-    let verifier = Verifier::new("bank-api", &f.registry, &f.status, &f.nonces);
-    let result = verifier.verify(&[&del.jws], &msg.jws);
+    let outcome = verifier(&f).verify(&[&del.jws], &msg.jws);
 
     assert!(matches!(
-        result,
+        outcome.decision,
         Err(VerificationFailure::InvalidDelegationSignature)
     ));
 }
@@ -208,10 +302,6 @@ fn rejects_delegation_signed_by_the_wrong_key() {
 #[test]
 fn rejects_expired_delegation() {
     let f = setup();
-    let mut del = issue_basic_delegation(&f, payment_scope(500.0));
-    // Tamper is not possible post-signature (that's the point) — instead
-    // issue with a window that's already in the past by re-signing directly.
-    del.payload.valid_until = Utc::now() - Duration::minutes(1);
     let del = delegation::issue(
         &f.principal_signer,
         DelegationParams {
@@ -237,10 +327,12 @@ fn rejects_expired_delegation() {
     )
     .unwrap();
 
-    let verifier = Verifier::new("bank-api", &f.registry, &f.status, &f.nonces);
-    let result = verifier.verify(&[&del.jws], &msg.jws);
+    let outcome = verifier(&f).verify(&[&del.jws], &msg.jws);
 
-    assert!(matches!(result, Err(VerificationFailure::Expired)));
+    assert!(matches!(
+        outcome.decision,
+        Err(VerificationFailure::Expired)
+    ));
 }
 
 #[test]
@@ -293,11 +385,19 @@ fn sub_delegation_chain_is_accepted_when_scope_narrows() {
     )
     .unwrap();
 
-    let verifier = Verifier::new("bank-api", &f.registry, &f.status, &f.nonces);
     // Leaf-first: the sub-delegation, then its parent.
-    let result = verifier.verify(&[&sub.jws, &root.jws], &msg.jws);
+    let outcome = verifier(&f).verify(&[&sub.jws, &root.jws], &msg.jws);
 
-    assert!(result.is_ok(), "expected accept, got {:?}", result.err());
+    assert!(
+        outcome.decision.is_ok(),
+        "expected accept, got {:?}",
+        outcome.decision.err()
+    );
+    let accepted_ids = &outcome.receipt.payload.delegation_ids;
+    assert_eq!(
+        accepted_ids,
+        &vec![sub.payload.delegation_id, root.payload.delegation_id]
+    );
 }
 
 #[test]
@@ -350,10 +450,12 @@ fn sub_delegation_chain_rejects_scope_widening() {
     )
     .unwrap();
 
-    let verifier = Verifier::new("bank-api", &f.registry, &f.status, &f.nonces);
-    let result = verifier.verify(&[&sub.jws, &root.jws], &msg.jws);
+    let outcome = verifier(&f).verify(&[&sub.jws, &root.jws], &msg.jws);
 
-    assert!(matches!(result, Err(VerificationFailure::ScopeNotNarrowed)));
+    assert!(matches!(
+        outcome.decision,
+        Err(VerificationFailure::ScopeNotNarrowed)
+    ));
 }
 
 #[test]
@@ -389,8 +491,10 @@ fn rejects_sub_delegation_when_parent_forbids_delegation() {
     )
     .unwrap();
 
-    let verifier = Verifier::new("bank-api", &f.registry, &f.status, &f.nonces);
-    let result = verifier.verify(&[&sub.jws, &root.jws], &msg.jws);
+    let outcome = verifier(&f).verify(&[&sub.jws, &root.jws], &msg.jws);
 
-    assert!(matches!(result, Err(VerificationFailure::ChainBroken(_))));
+    assert!(matches!(
+        outcome.decision,
+        Err(VerificationFailure::ChainBroken(_))
+    ));
 }

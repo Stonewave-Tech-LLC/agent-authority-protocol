@@ -1,14 +1,19 @@
-//! The 9-step verification flow from docs/verification-flow.md. This is the
-//! only place authority is granted — everything above (issuance, tokens,
-//! scope) exists to make this function's job either trivially satisfiable
-//! or a hard, explicit rejection.
+//! The 9-step verification flow from docs/verification-flow.md, plus a
+//! signed Receipt for every outcome. This is the only place authority is
+//! granted — everything above (issuance, tokens, scope) exists to make this
+//! function's job either trivially satisfiable or a hard, explicit
+//! rejection, and every call leaves behind a durable, checkable record of
+//! which one it was.
 
 use chrono::Utc;
+use uuid::Uuid;
 
 use crate::jws::jwk_to_public_key;
 use crate::nonce::NonceStore;
+use crate::receipt::{digest_request, Receipt, ReceiptOutcome};
 use crate::resolver::KeyResolver;
 use crate::scope;
+use crate::signer::Signer;
 use crate::status::StatusChecker;
 use crate::token::{AgentMessageToken, DelegationToken};
 use crate::types::{AgentMessage, Delegation, VerificationFailure};
@@ -19,20 +24,43 @@ pub struct VerifiedAction {
     pub agent_message: AgentMessage,
 }
 
-pub struct Verifier<'a, R: KeyResolver, S: StatusChecker, N: NonceStore> {
+pub struct IssuedReceipt {
+    pub jws: String,
+    pub payload: Receipt,
+}
+
+pub struct VerificationOutcome {
+    pub decision: Result<VerifiedAction, VerificationFailure>,
+    /// Signed regardless of `decision` — a rejection is recorded just as
+    /// durably as an acceptance.
+    pub receipt: IssuedReceipt,
+}
+
+pub struct Verifier<'a, R: KeyResolver, S: StatusChecker, N: NonceStore, SG: Signer> {
+    verifier_id: String,
     audience: String,
     resolver: &'a R,
     status: &'a S,
     nonces: &'a N,
+    receipt_signer: &'a SG,
 }
 
-impl<'a, R: KeyResolver, S: StatusChecker, N: NonceStore> Verifier<'a, R, S, N> {
-    pub fn new(audience: impl Into<String>, resolver: &'a R, status: &'a S, nonces: &'a N) -> Self {
+impl<'a, R: KeyResolver, S: StatusChecker, N: NonceStore, SG: Signer> Verifier<'a, R, S, N, SG> {
+    pub fn new(
+        verifier_id: impl Into<String>,
+        audience: impl Into<String>,
+        resolver: &'a R,
+        status: &'a S,
+        nonces: &'a N,
+        receipt_signer: &'a SG,
+    ) -> Self {
         Self {
+            verifier_id: verifier_id.into(),
             audience: audience.into(),
             resolver,
             status,
             nonces,
+            receipt_signer,
         }
     }
 
@@ -41,6 +69,16 @@ impl<'a, R: KeyResolver, S: StatusChecker, N: NonceStore> Verifier<'a, R, S, N> 
     /// subsequent entry is its parent, up to the principal-issued root.
     /// A direct (non-chained) delegation is simply a chain of length 1.
     pub fn verify(
+        &self,
+        delegation_chain_jws: &[&str],
+        agent_message_jws: &str,
+    ) -> VerificationOutcome {
+        let decision = self.verify_inner(delegation_chain_jws, agent_message_jws);
+        let receipt = self.issue_receipt(delegation_chain_jws, agent_message_jws, &decision);
+        VerificationOutcome { decision, receipt }
+    }
+
+    fn verify_inner(
         &self,
         delegation_chain_jws: &[&str],
         agent_message_jws: &str,
@@ -144,5 +182,69 @@ impl<'a, R: KeyResolver, S: StatusChecker, N: NonceStore> Verifier<'a, R, S, N> 
             delegation_chain: verified_payloads,
             agent_message: verified_msg.payload,
         })
+    }
+
+    fn issue_receipt(
+        &self,
+        delegation_chain_jws: &[&str],
+        agent_message_jws: &str,
+        decision: &Result<VerifiedAction, VerificationFailure>,
+    ) -> IssuedReceipt {
+        let (delegation_ids, agent_id, outcome): (Vec<Uuid>, String, ReceiptOutcome) =
+            match decision {
+                Ok(action) => (
+                    action
+                        .delegation_chain
+                        .iter()
+                        .map(|d| d.delegation_id)
+                        .collect(),
+                    action.agent_message.agent_id.clone(),
+                    ReceiptOutcome::Accepted,
+                ),
+                Err(reason) => {
+                    // Best-effort, unverified: enough for the receipt to be
+                    // traceable even when the cryptographic check itself is
+                    // what failed. Never treated as authorization — only ever
+                    // read back off an already-rejected receipt.
+                    let leaf = delegation_chain_jws
+                        .first()
+                        .and_then(|jws| DelegationToken::from_jws(*jws).ok());
+
+                    let agent_id = AgentMessageToken::from_jws(agent_message_jws)
+                        .ok()
+                        .map(|t| t.payload.agent_id)
+                        .or_else(|| leaf.as_ref().map(|t| t.payload.agent_id.clone()))
+                        .unwrap_or_else(|| "unknown".to_string());
+
+                    let delegation_ids = leaf
+                        .map(|t| vec![t.payload.delegation_id])
+                        .unwrap_or_default();
+
+                    (
+                        delegation_ids,
+                        agent_id,
+                        ReceiptOutcome::Rejected {
+                            reason: reason.to_string(),
+                        },
+                    )
+                }
+            };
+
+        let payload = Receipt {
+            receipt_id: Uuid::new_v4(),
+            verifier_id: self.verifier_id.clone(),
+            agent_id,
+            delegation_ids,
+            request_digest: digest_request(agent_message_jws),
+            outcome,
+            decided_at: Utc::now(),
+        };
+
+        let jws = self
+            .receipt_signer
+            .sign_payload(&payload)
+            .expect("signing a receipt with a local key must not fail");
+
+        IssuedReceipt { jws, payload }
     }
 }

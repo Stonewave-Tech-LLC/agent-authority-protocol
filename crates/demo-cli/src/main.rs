@@ -2,8 +2,8 @@ use chrono::{Duration, Utc};
 
 use aap_core::{
     delegation, message, ActionRequest, Amount, DelegationParams, InMemoryNonceStore,
-    InMemoryRegistry, InMemoryStatus, LocalSigner, PrincipalType, Scope, Signer,
-    VerificationFailure, Verifier,
+    InMemoryRegistry, InMemoryStatus, LocalSigner, PrincipalType, ReceiptOutcome, Scope, Signer,
+    VerificationOutcome, Verifier,
 };
 
 fn line() {
@@ -22,7 +22,15 @@ fn main() {
 
     let status = InMemoryStatus::new();
     let nonces = InMemoryNonceStore::new();
-    let verifier = Verifier::new("bank-api", &registry, &status, &nonces);
+    let receipt_signer = LocalSigner::generate();
+    let verifier = Verifier::new(
+        "verifier:bank-api",
+        "bank-api",
+        &registry,
+        &status,
+        &nonces,
+        &receipt_signer,
+    );
 
     // --- Principal issues a Delegation: Wave may create payments up to 200 EUR.
     println!("1) Principal 'neo' issues a Delegation to Agent 'wave-1':");
@@ -114,10 +122,12 @@ fn main() {
 
     println!("Done. Every accept/reject above was decided by pure signature + time +");
     println!("revocation + scope checks in aap-core::verifier — no LLM in the trust path.");
+    println!("Every one of those decisions also left behind a signed Receipt (see above),");
+    println!("checkable later by anyone holding the Verifier's public key.");
 }
 
-fn report(result: Result<aap_core::VerifiedAction, VerificationFailure>) {
-    match result {
+fn report(outcome: VerificationOutcome) {
+    match outcome.decision {
         Ok(action) => {
             println!(
                 "   -> ACCEPTED: agent '{}' authorized to '{}' (chain depth {})",
@@ -130,4 +140,12 @@ fn report(result: Result<aap_core::VerifiedAction, VerificationFailure>) {
             println!("   -> REJECTED: {reason}");
         }
     }
+    let outcome_label = match outcome.receipt.payload.outcome {
+        ReceiptOutcome::Accepted => "accepted".to_string(),
+        ReceiptOutcome::Rejected { ref reason } => format!("rejected ({reason})"),
+    };
+    println!(
+        "      receipt {} [{}], digest {}",
+        outcome.receipt.payload.receipt_id, outcome_label, outcome.receipt.payload.request_digest
+    );
 }
