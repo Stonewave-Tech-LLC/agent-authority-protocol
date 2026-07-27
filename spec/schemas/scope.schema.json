@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-authority-protocol.org/schemas/scope.schema.json",
+  "title": "Scope",
+  "description": "Structured, deterministically-matchable authorization boundary. A Verifier checks a requested action against this object with pure boolean logic — never with an LLM.",
+  "type": "object",
+  "required": ["actions"],
+  "properties": {
+    "actions": {
+      "type": "array",
+      "description": "Allow-list of action types this delegation permits, e.g. 'read_invoice', 'create_payment', 'send_message'. An action not listed here is implicitly denied.",
+      "items": { "type": "string" },
+      "minItems": 1
+    },
+    "resources": {
+      "type": "array",
+      "description": "Allow-list of resource/system identifiers the actions may target (API name, account ID, document ID pattern). Omit to mean 'any resource', but prefer being explicit.",
+      "items": { "type": "string" }
+    },
+    "max_amount": {
+      "type": "object",
+      "description": "Optional monetary/quantity ceiling, checked per single action and optionally aggregated by the Verifier's own policy.",
+      "properties": {
+        "value": { "type": "number", "minimum": 0 },
+        "currency": { "type": "string" }
+      },
+      "required": ["value", "currency"]
+    },
+    "counterparties": {
+      "type": "object",
+      "description": "Optional allow/deny list of who the action may target or interact with.",
+      "properties": {
+        "allow": { "type": "array", "items": { "type": "string" } },
+        "deny": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "data_categories": {
+      "type": "array",
+      "description": "Optional allow-list of data categories the agent may read/write/transmit.",
+      "items": { "type": "string" }
+    },
+    "time_windows": {
+      "type": "array",
+      "description": "Optional recurring windows during which the delegation may be exercised, in addition to valid_from/valid_until.",
+      "items": {
+        "type": "object",
+        "required": ["days", "start", "end", "timezone"],
+        "properties": {
+          "days": {
+            "type": "array",
+            "items": { "enum": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] }
+          },
+          "start": { "type": "string", "pattern": "^([01]\\d|2[0-3]):[0-5]\\d$" },
+          "end": { "type": "string", "pattern": "^([01]\\d|2[0-3]):[0-5]\\d$" },
+          "timezone": { "type": "string" }
+        }
+      }
+    }
+  },
+  "additionalProperties": false
+}

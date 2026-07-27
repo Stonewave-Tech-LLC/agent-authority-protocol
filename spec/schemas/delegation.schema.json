@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-authority-protocol.org/schemas/delegation.schema.json",
+  "title": "Delegation",
+  "description": "Signed authorization from a Principal to an Agent. Transported as the payload of a JWS (JWT). The issuer_signature field is NOT part of the signed payload — it IS the JWS signature wrapping this object.",
+  "type": "object",
+  "required": [
+    "delegation_id",
+    "principal_id",
+    "principal_type",
+    "agent_id",
+    "agent_public_key",
+    "scope",
+    "valid_from",
+    "valid_until",
+    "status_endpoint",
+    "can_delegate",
+    "issued_at"
+  ],
+  "properties": {
+    "delegation_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Unique ID for this delegation. Used for revocation lookups and audit trails."
+    },
+    "principal_id": {
+      "type": "string",
+      "description": "Resolvable identifier of the principal (registry-issued ID or DID in later phases)."
+    },
+    "principal_type": {
+      "type": "string",
+      "enum": ["natural_person", "legal_entity"]
+    },
+    "agent_id": {
+      "type": "string",
+      "description": "Identifier of the agent receiving authority."
+    },
+    "agent_public_key": {
+      "type": "object",
+      "description": "JWK of the agent's own signing key. Bound to this delegation.",
+      "required": ["kty", "crv", "x"],
+      "properties": {
+        "kty": { "type": "string" },
+        "crv": { "type": "string" },
+        "x": { "type": "string" },
+        "y": { "type": "string" }
+      }
+    },
+    "scope": { "$ref": "scope.schema.json" },
+    "valid_from": { "type": "string", "format": "date-time" },
+    "valid_until": { "type": "string", "format": "date-time" },
+    "status_endpoint": {
+      "type": "string",
+      "format": "uri",
+      "description": "URL a Verifier calls to check current revocation status of delegation_id."
+    },
+    "can_delegate": {
+      "type": "boolean",
+      "default": false,
+      "description": "Whether the Agent may issue a narrower sub-delegation to another Agent."
+    },
+    "max_delegation_depth": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Only meaningful if can_delegate is true. Caps remaining chain length."
+    },
+    "parent_delegation_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Set only on sub-delegations. Points to the delegation this one narrows."
+    },
+    "issued_at": { "type": "string", "format": "date-time" },
+    "metadata": {
+      "type": "object",
+      "description": "Optional, non-authoritative. Purpose, human explanation, policy URI, etc.",
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": false
+}

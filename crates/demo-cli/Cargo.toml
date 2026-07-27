@@ -1,0 +1,12 @@
+[package]
+name = "aap-demo-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Runnable end-to-end demo of the Agent Authority Protocol reference implementation."
+
+[dependencies]
+aap-core = { path = "../core" }
+chrono.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
