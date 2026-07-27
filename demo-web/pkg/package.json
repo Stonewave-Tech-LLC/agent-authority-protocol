@@ -1,0 +1,17 @@
+{
+  "name": "aap-wasm-demo",
+  "type": "module",
+  "description": "WASM bindings exposing the aap-core demo story to a browser page.",
+  "version": "0.0.1",
+  "license": "MIT",
+  "files": [
+    "aap_wasm_demo_bg.wasm",
+    "aap_wasm_demo.js",
+    "aap_wasm_demo.d.ts"
+  ],
+  "main": "aap_wasm_demo.js",
+  "types": "aap_wasm_demo.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}

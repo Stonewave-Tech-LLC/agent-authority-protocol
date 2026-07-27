@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Agent Authority Protocol — Live Demo</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0b0f14;
+    --panel: #121824;
+    --border: #24304a;
+    --text: #e6edf7;
+    --muted: #8a97ad;
+    --accent: #5b9dff;
+    --green: #35d08a;
+    --red: #ff5f6d;
+    --mono: "SF Mono", "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 2rem 1.25rem 4rem;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    display: flex;
+    justify-content: center;
+  }
+  main { width: 100%; max-width: 780px; }
+  h1 { font-size: 1.4rem; margin: 0 0 0.25rem; }
+  .subtitle { color: var(--muted); margin: 0 0 1.75rem; font-size: 0.95rem; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.1rem 1.3rem;
+    margin-bottom: 1.25rem;
+  }
+  .panel h2 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 0.75rem; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 0.35rem 0.9rem; font-size: 0.9rem; }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; font-family: var(--mono); word-break: break-all; }
+  .controls { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center; }
+  input[type="number"] {
+    background: #0d1420; border: 1px solid var(--border); color: var(--text);
+    border-radius: 8px; padding: 0.55rem 0.7rem; width: 8rem; font-size: 0.95rem;
+  }
+  button {
+    background: var(--accent); color: #05070a; border: none; border-radius: 8px;
+    padding: 0.55rem 1rem; font-size: 0.9rem; font-weight: 600; cursor: pointer;
+  }
+  button.secondary { background: transparent; color: var(--text); border: 1px solid var(--border); }
+  button.danger { background: var(--red); color: #1a0507; }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  button:hover:not(:disabled) { filter: brightness(1.08); }
+  #log { display: flex; flex-direction: column; gap: 0.6rem; max-height: 480px; overflow-y: auto; }
+  .entry { border: 1px solid var(--border); border-radius: 10px; padding: 0.7rem 0.9rem; font-size: 0.87rem; }
+  .entry.accepted { border-color: rgba(53, 208, 138, 0.5); background: rgba(53, 208, 138, 0.06); }
+  .entry.rejected { border-color: rgba(255, 95, 109, 0.5); background: rgba(255, 95, 109, 0.06); }
+  .badge { display: inline-block; font-size: 0.72rem; font-weight: 700; letter-spacing: 0.04em; border-radius: 5px; padding: 0.15rem 0.5rem; margin-right: 0.5rem; }
+  .badge.accepted { background: var(--green); color: #04140c; }
+  .badge.rejected { background: var(--red); color: #1a0507; }
+  .entry .action { font-weight: 600; }
+  .entry .meta { color: var(--muted); font-family: var(--mono); font-size: 0.78rem; margin-top: 0.35rem; word-break: break-all; }
+  footer { color: var(--muted); font-size: 0.8rem; margin-top: 1.5rem; line-height: 1.5; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Agent Authority Protocol</h1>
+  <p class="subtitle">Live in-browser demo — every decision below is made by <code>aap-core::Verifier</code>, compiled to WASM, running entirely in this tab. No server, no LLM in the trust path.</p>
+
+  <div class="panel">
+    <h2>Delegation</h2>
+    <dl class="kv" id="delegation-info">
+      <dt>status</dt><dd>issuing…</dd>
+    </dl>
+  </div>
+
+  <div class="panel">
+    <h2>Send a request as Agent "wave-1"</h2>
+    <div class="controls">
+      <input type="number" id="amount" value="150" min="0" step="10" />
+      <span style="color: var(--muted);">EUR — create_payment</span>
+      <button id="send" disabled>Send request</button>
+      <button id="replay" class="secondary" disabled>Replay last message</button>
+      <button id="revoke" class="danger" disabled>Revoke delegation</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Decisions &amp; signed receipts</h2>
+    <div id="log"></div>
+  </div>
+
+  <footer>
+    Try: 150 (in scope, accepted) → 5000 (over the 200 EUR ceiling, rejected) →
+    replay the same request (rejected, nonce reuse) → revoke → any amount (rejected, revoked).<br />
+    Source: <a href="https://github.com" onclick="return false;" style="pointer-events:none; color:var(--muted);">crates/core</a> in this repository.
+  </footer>
+</main>
+
+<script type="module">
+  import init, { DemoSession } from "./pkg/aap_wasm_demo.js";
+
+  const logEl = document.getElementById("log");
+  const delegationInfoEl = document.getElementById("delegation-info");
+  const amountEl = document.getElementById("amount");
+  const sendBtn = document.getElementById("send");
+  const replayBtn = document.getElementById("replay");
+  const revokeBtn = document.getElementById("revoke");
+
+  function addEntry({ label, verdict, meta }) {
+    const div = document.createElement("div");
+    div.className = `entry ${verdict}`;
+    const badge = verdict === "accepted" ? "ACCEPTED" : "REJECTED";
+    div.innerHTML = `<span class="badge ${verdict}">${badge}</span><span class="action">${label}</span><div class="meta">${meta}</div>`;
+    logEl.prepend(div);
+  }
+
+  function renderOutcome(label, json) {
+    const result = JSON.parse(json);
+    const verdict = result.accepted ? "accepted" : "rejected";
+    const reasonPart = result.accepted ? "" : ` — ${result.reason}`;
+    const meta = `receipt ${result.receipt_id} · digest ${result.digest} · verifier decision: ${result.receipt_outcome}`;
+    addEntry({ label: `${label}${reasonPart}`, verdict, meta });
+  }
+
+  async function run() {
+    await init();
+    const session = new DemoSession();
+
+    const summary = JSON.parse(session.delegation_summary());
+    delegationInfoEl.innerHTML = `
+      <dt>delegation_id</dt><dd>${summary.delegation_id}</dd>
+      <dt>principal</dt><dd>${summary.principal_id}</dd>
+      <dt>agent</dt><dd>${summary.agent_id}</dd>
+      <dt>scope</dt><dd>${summary.scope_summary}</dd>
+    `;
+    addEntry({
+      label: "Delegation issued by principal:neo to agent:wave-1",
+      verdict: "accepted",
+      meta: `delegation_id ${summary.delegation_id}`,
+    });
+
+    sendBtn.disabled = false;
+    replayBtn.disabled = false;
+    revokeBtn.disabled = false;
+
+    sendBtn.addEventListener("click", () => {
+      const amount = Number(amountEl.value);
+      const json = session.request(amount);
+      renderOutcome(`create_payment ${amount} EUR`, json);
+    });
+
+    replayBtn.addEventListener("click", () => {
+      const json = session.replay_last();
+      const parsed = JSON.parse(json);
+      if (parsed.error) {
+        addEntry({ label: parsed.error, verdict: "rejected", meta: "" });
+        return;
+      }
+      renderOutcome("Replay of last signed message", json);
+    });
+
+    revokeBtn.addEventListener("click", () => {
+      const json = session.revoke();
+      const parsed = JSON.parse(json);
+      addEntry({
+        label: "Principal revokes the delegation",
+        verdict: "rejected",
+        meta: `delegation_id ${parsed.delegation_id}`,
+      });
+    });
+  }
+
+  run().catch((err) => {
+    console.error(err);
+    delegationInfoEl.innerHTML = `<dt>error</dt><dd>${err}</dd>`;
+  });
+</script>
+</body>
+</html>

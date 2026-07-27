@@ -22,6 +22,21 @@ cargo test --workspace   # 25 tests: scope matching, full verification flow, sub
 
 The core crate (`aap-core`) is written in Rust rather than the originally-considered TypeScript specifically because of a compile-time guarantee TS's structural typing can't give: a typestate pattern (`crates/core/src/token.rs`) makes `Unverified` and `Verified` delegations/messages distinct Rust types. The only way to obtain a `Verified` token is a successful `verify_signature()` call — a function that grants authority cannot even compile if it accepts an unverified token.
 
+## Live browser demo
+
+The same `aap-core` Verifier compiled to WASM, running the identical story interactively in a page — issue a Delegation, send a request, watch it get accepted or rejected, replay it, revoke it — with signed Receipts shown for every decision.
+
+```bash
+cd demo-web && python3 -m http.server 3040
+# open http://localhost:3040
+```
+
+`demo-web/pkg/` is a committed build of [`crates/wasm-demo`](crates/wasm-demo) so the demo runs with nothing but Python. To rebuild it after changing `aap-core` or `aap-wasm-demo`:
+
+```bash
+wasm-pack build crates/wasm-demo --target web --out-dir ../../demo-web/pkg
+```
+
 ## Design decisions for v1
 
 | Topic | v1 choice | Rationale |
@@ -41,7 +56,7 @@ The core crate (`aap-core`) is written in Rust rather than the originally-consid
 - **Phase 0 — Spec**: Delegation schema, Scope language, verification flow, minimal message set. ✅
 - **Phase 1 — Minimal prototype**: principal/agent keypairs, issue + sign a Delegation, a Verifier that checks signature + time + revocation + scope, a runnable demo. ✅
 - **Phase 2 — Robustness**: sub-delegation chains ✅, audit receipts ✅, pluggable KMS-backed Signer (still local-key only), real centralized registry service (still in-memory), Handoff/Escalate message types.
-- **Phase 3 — Opening up**: DID/VC-compatible resolver, mapping to A2A / OpenID AuthZEN / GNAP, WASM bindings + browser demo, public spec + reference implementation, legal/regulatory write-up (EU focus).
+- **Phase 3 — Opening up**: WASM bindings + browser demo ✅, DID/VC-compatible resolver, mapping to A2A / OpenID AuthZEN / GNAP, public spec + reference implementation, legal/regulatory write-up (EU focus).
 
 ## Non-goals (for now)
 

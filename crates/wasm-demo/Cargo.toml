@@ -1,0 +1,21 @@
+[package]
+name = "aap-wasm-demo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WASM bindings exposing the aap-core demo story to a browser page."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+aap-core = { path = "../core" }
+wasm-bindgen = "0.2"
+serde_json.workspace = true
+chrono.workspace = true
+uuid = { workspace = true, features = ["js"] }
+console_error_panic_hook = "0.1"
+
+[dependencies.getrandom]
+version = "0.2"
+features = ["js"]
