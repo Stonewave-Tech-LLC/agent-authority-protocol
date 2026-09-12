@@ -1,5 +1,6 @@
 pub mod delegation;
 pub mod jws;
+pub mod keys;
 pub mod message;
 pub mod nonce;
 pub mod receipt;
@@ -12,6 +13,7 @@ pub mod types;
 pub mod verifier;
 
 pub use delegation::{DelegationParams, IssuedDelegation};
+pub use keys::{SigningKey, VerifyingKey};
 pub use message::IssuedAgentMessage;
 pub use nonce::{InMemoryNonceStore, NonceStore};
 pub use receipt::{Receipt, ReceiptOutcome};

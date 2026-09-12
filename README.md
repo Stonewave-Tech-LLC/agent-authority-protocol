@@ -42,7 +42,7 @@ wasm-pack build crates/wasm-demo --target web --out-dir ../../demo-web/pkg
 | Topic | v1 choice | Rationale |
 |---|---|---|
 | Language | Rust, not TypeScript | Typestate pattern enforces "unverified data can't be treated as verified" at compile time — the exact bug class that matters most for a trust protocol |
-| Signature format | Compact JWS (RFC 7515), hand-rolled over Ed25519 (`ed25519-dalek`) | Don't reinvent crypto, just the thin envelope; full control over the payload shape instead of fighting a claims-bag JWT library |
+| Signature format | Compact JWS (RFC 7515), hand-rolled over Ed25519 (`ed25519-dalek`) **and ECDSA P-256** (`p256`) | Don't reinvent crypto, just the thin envelope; full control over the payload shape instead of fighting a claims-bag JWT library. P-256 exists specifically because a phone/laptop Secure Enclave can only ever produce P-256 keys, never Ed25519 — a hardware-backed device approval key has no choice of curve. `alg` header is checked against the caller-supplied key's own algorithm before any cryptographic verification runs (`keys.rs`), so EdDSA- and ES256-signed messages can never be confused for one another. |
 | Delegation object | Custom JSON Schema, JWT-signed | Full VC/SD-JWT-VC machinery is overkill before the concept is proven |
 | Revocation | Status endpoint (`{revoked: bool}`) + `valid_until` | IETF Token Status List is the real long-term answer; not worth building now |
 | Scope check | Pure deterministic function, see [`spec/scope-matching.md`](spec/scope-matching.md) | This is the actual trust boundary — must never be "interpreted" |
