@@ -18,6 +18,7 @@ pub trait Signer {
     fn public_jwk(&self) -> PublicKeyJwk;
 }
 
+#[derive(Clone)]
 pub struct LocalSigner {
     key: Key,
 }
