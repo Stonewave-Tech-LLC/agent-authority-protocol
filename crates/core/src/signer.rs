@@ -18,6 +18,7 @@ pub trait Signer {
     fn public_jwk(&self) -> PublicKeyJwk;
 }
 
+#[derive(Clone)]
 pub struct LocalSigner {
     key: Key,
 }
@@ -50,6 +51,19 @@ impl LocalSigner {
     pub fn from_ed25519_bytes(bytes: &[u8; 32]) -> Self {
         Self {
             key: Key::Ed25519(ed25519_dalek::SigningKey::from_bytes(bytes)),
+        }
+    }
+
+    /// Raw 32-byte seed, for persisting a server-held Ed25519 key (e.g. a
+    /// verifier's receipt-signing key) across process restarts via
+    /// `from_ed25519_bytes`. `None` for a P-256 key — those are never meant
+    /// to be extracted/persisted this way in the first place (a real device
+    /// key lives in a Secure Enclave and never yields raw bytes at all;
+    /// `LocalSigner::generate_p256()` exists only for tests/the CLI demo).
+    pub fn to_ed25519_bytes(&self) -> Option<[u8; 32]> {
+        match &self.key {
+            Key::Ed25519(k) => Some(k.to_bytes()),
+            Key::P256(_) => None,
         }
     }
 }
