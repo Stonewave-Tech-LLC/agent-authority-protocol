@@ -19,6 +19,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use base64::Engine as _;
 use deadpool_postgres::Pool;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -73,22 +74,31 @@ async fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(8500);
 
-    // TODO(phase 1 follow-up): load a persisted Ed25519 seed from
-    // AAP_VERIFIER_RECEIPT_SIGNING_KEY instead of always generating fresh.
-    // Left as a loud startup warning rather than silently accepted, so it
-    // can't be mistaken for "already handled". Every receipt issued by THIS
-    // process instance is internally consistent (same key for the whole
-    // run — cloned once into every request handler below), but a restart
-    // today invalidates the ability to verify old receipts against a
-    // stable verifier public key.
-    if std::env::var("AAP_VERIFIER_RECEIPT_SIGNING_KEY").is_err() {
-        tracing::warn!(
-            "AAP_VERIFIER_RECEIPT_SIGNING_KEY not set — generating an ephemeral receipt \
-             signing key for this process run. Fine for local dev, NOT fine for production: \
-             receipts won't be checkable against a stable key across restarts."
-        );
-    }
-    let receipt_signer = LocalSigner::generate();
+    // AAP_VERIFIER_RECEIPT_SIGNING_KEY: base64url (no padding) of a raw
+    // 32-byte Ed25519 seed. Kept as a stable, persisted key (not
+    // regenerated per process start) so a receipt issued today stays
+    // checkable against this verifier's public key after a restart.
+    // Generate one with:
+    //   cargo run -p aap-verifier-service --example generate_receipt_signing_key
+    let receipt_signer = match std::env::var("AAP_VERIFIER_RECEIPT_SIGNING_KEY") {
+        Ok(encoded) => {
+            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(encoded.trim())
+                .expect("AAP_VERIFIER_RECEIPT_SIGNING_KEY must be valid base64url");
+            let seed: [u8; 32] = bytes
+                .try_into()
+                .expect("AAP_VERIFIER_RECEIPT_SIGNING_KEY must decode to exactly 32 bytes");
+            LocalSigner::from_ed25519_bytes(&seed)
+        }
+        Err(_) => {
+            tracing::warn!(
+                "AAP_VERIFIER_RECEIPT_SIGNING_KEY not set — generating an ephemeral receipt \
+                 signing key for this process run. Fine for local dev, NOT fine for production: \
+                 receipts won't be checkable against a stable key across restarts."
+            );
+            LocalSigner::generate()
+        }
+    };
 
     let pool = db::build_pool(&database_url);
 
