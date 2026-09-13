@@ -103,6 +103,10 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(health))
         .route("/verify", post(verify))
+        .route(
+            "/verify-delegation-signature",
+            post(verify_delegation_signature),
+        )
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
@@ -218,5 +222,79 @@ async fn verify(
         reason,
         receipt_id: receipt.payload.receipt_id,
         receipt_jws: receipt.jws,
+    }))
+}
+
+#[derive(Deserialize)]
+struct VerifyDelegationSignatureRequest {
+    delegation_jws: String,
+}
+
+#[derive(Serialize)]
+struct VerifyDelegationSignatureResponse {
+    valid: bool,
+    reason: Option<String>,
+    delegation: Option<aap_core::Delegation>,
+}
+
+/// Used by the device-pairing finalize step (stonewave-systems): confirms a
+/// freshly-issued Delegation was genuinely signed by the claimed principal's
+/// own key, right now, within its stated validity window. Deliberately
+/// narrower than `/verify`: no AgentMessage, no scope/nonce/audience check —
+/// there is no request being authorized yet, only "is this Delegation
+/// itself real". stonewave-systems is the one that decides whether to
+/// persist it into aap_delegations after this comes back valid.
+async fn verify_delegation_signature(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<VerifyDelegationSignatureRequest>,
+) -> Result<Json<VerifyDelegationSignatureResponse>, (StatusCode, String)> {
+    if !authorized(&headers, &state.shared_secret) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "invalid or missing x-verifier-secret".into(),
+        ));
+    }
+
+    let Ok(unverified) = DelegationToken::from_jws(&req.delegation_jws) else {
+        return Ok(Json(VerifyDelegationSignatureResponse {
+            valid: false,
+            reason: Some("malformed delegation JWS".into()),
+            delegation: None,
+        }));
+    };
+    let principal_id = unverified.payload.principal_id.clone();
+
+    let registry = db::registry_with_principal_key(&state.pool, &principal_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let verified = match aap_core::KeyResolver::resolve_principal_key(&registry, &principal_id)
+        .ok()
+        .and_then(|key| unverified.verify_signature(&key).ok())
+    {
+        Some(v) => v,
+        None => {
+            return Ok(Json(VerifyDelegationSignatureResponse {
+                valid: false,
+                reason: Some("signature invalid or unknown principal_id".into()),
+                delegation: None,
+            }))
+        }
+    };
+
+    let now = chrono::Utc::now();
+    if now < verified.payload.valid_from || now > verified.payload.valid_until {
+        return Ok(Json(VerifyDelegationSignatureResponse {
+            valid: false,
+            reason: Some("delegation is outside its valid_from/valid_until window".into()),
+            delegation: None,
+        }));
+    }
+
+    Ok(Json(VerifyDelegationSignatureResponse {
+        valid: true,
+        reason: None,
+        delegation: Some(verified.payload),
     }))
 }
