@@ -61,12 +61,18 @@ pub struct Scope {
     pub time_windows: Option<Vec<TimeWindow>>,
 }
 
-/// Ed25519 public key, JWK-ish shape (x = base64url raw 32 bytes).
+/// JWK-ish shape covering both supported algorithms:
+/// - Ed25519 (kty="OKP", crv="Ed25519"): `x` only, 32 raw bytes.
+/// - ECDSA P-256 (kty="EC", crv="P-256"): `x` and `y`, 32 raw bytes each
+///   (uncompressed point coordinates) — required by the JWK spec for EC
+///   keys, unlike OKP which has no `y`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PublicKeyJwk {
-    pub kty: String, // "OKP"
-    pub crv: String, // "Ed25519"
+    pub kty: String, // "OKP" or "EC"
+    pub crv: String, // "Ed25519" or "P-256"
     pub x: String,   // base64url, no padding
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y: Option<String>, // present only for EC keys
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

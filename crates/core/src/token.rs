@@ -7,10 +7,10 @@
 
 use std::marker::PhantomData;
 
-use ed25519_dalek::VerifyingKey;
 use uuid::Uuid;
 
 use crate::jws::{self, JwsError};
+use crate::keys::VerifyingKey;
 use crate::types::{AgentMessage, Delegation};
 
 pub struct Unverified;

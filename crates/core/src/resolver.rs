@@ -5,9 +5,8 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use ed25519_dalek::VerifyingKey;
-
 use crate::jws::{jwk_to_public_key, JwsError};
+use crate::keys::VerifyingKey;
 use crate::types::PublicKeyJwk;
 
 pub trait KeyResolver {
