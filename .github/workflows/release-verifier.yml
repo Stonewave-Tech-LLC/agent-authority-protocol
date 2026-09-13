@@ -1,0 +1,57 @@
+name: Release verifier-service
+
+# Deliberately its own workflow/tag namespace (verifier-v*), separate from
+# any future protocol-wide version tag — aap-verifier-service is one
+# deployable binary within this repo, not the whole protocol's release.
+#
+# Statically linked against musl rather than the runner's glibc: this
+# binary is built on a GitHub-hosted Ubuntu runner but deployed onto a
+# different box (a Debian server) — musl removes any risk of a glibc
+# version mismatch between build and deploy targets, which is the actual
+# point of building in CI instead of on the deploy target itself (Neo's
+# 2026-09-12 decision: CI build, not a Rust toolchain installed on the
+# server). aap-verifier-service has no OpenSSL/native-TLS dependency
+# (tokio-postgres connects with NoTls to a same-host/private-network
+# Postgres), so a musl static build has no missing-native-dep risk either.
+
+on:
+  push:
+    tags: ['verifier-v*']
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (musl target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl build tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test before releasing anything
+        run: cargo test --workspace
+
+      - name: Build release binary (static musl)
+        run: cargo build --release --target x86_64-unknown-linux-musl -p aap-verifier-service
+
+      - name: Package
+        run: |
+          cd target/x86_64-unknown-linux-musl/release
+          tar -czf aap-verifier-service-x86_64-unknown-linux-musl.tar.gz aap-verifier-service
+          sha256sum aap-verifier-service-x86_64-unknown-linux-musl.tar.gz > aap-verifier-service-x86_64-unknown-linux-musl.tar.gz.sha256
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/x86_64-unknown-linux-musl/release/aap-verifier-service-x86_64-unknown-linux-musl.tar.gz
+            target/x86_64-unknown-linux-musl/release/aap-verifier-service-x86_64-unknown-linux-musl.tar.gz.sha256
