@@ -1,0 +1,24 @@
+[package]
+name = "aap-admin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Principal-side CLI: generates/holds Neo's AAP principal key locally (never leaves this machine), registers its public key with the server, and signs Delegations for devices requesting to be paired."
+
+[[bin]]
+name = "aap-admin"
+path = "src/main.rs"
+
+[dependencies]
+aap-core = { path = "../core" }
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+base64.workspace = true
+rand.workspace = true
+rpassword = "7"
+dirs = "5"
+aes-gcm = "0.10"
+argon2 = "0.5"
