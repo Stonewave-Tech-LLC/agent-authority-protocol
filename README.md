@@ -1,4 +1,4 @@
-# Agent Authority Protocol (working title)
+# Agent Authority Protocol
 
 A protocol for authenticated, authorized, and liability-attributable actions by AI agents — toward other agents, humans, software systems, and authorities.
 
