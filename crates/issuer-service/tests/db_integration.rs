@@ -375,7 +375,17 @@ async fn expired_challenge_cannot_be_consumed_concurrently_twice() {
 async fn every_enrollment_rejection_path_is_closed() {
     db_test!(db, {
         let pki = Pki::new();
-        let api = Api::new(&db, &pki, &[]); // staging, development aaguid NOT accepted
+        // staging, development aaguid NOT accepted. Each case is one challenge
+        // plus one enrollment from the same test IP, so lift the per-minute
+        // limits above the number of cases (rate limiting has its own test).
+        let api = Api::new(
+            &db,
+            &pki,
+            &[
+                ("ISSUER_RATE_CHALLENGE_PER_MIN", "1000"),
+                ("ISSUER_RATE_ENROLLMENT_PER_MIN", "1000"),
+            ],
+        );
         let other_principal = Principal::new();
 
         type Tweak = Box<dyn for<'a> Fn(&mut Enrollment<'a>, &'a Principal)>;
