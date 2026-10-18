@@ -15,6 +15,7 @@ use aap_core::token::{AgentMessageToken, DelegationToken};
 use aap_core::verifier::{DEFAULT_MAX_CLOCK_SKEW_SECS, DEFAULT_MAX_MESSAGE_AGE_SECS};
 use aap_core::{LocalSigner, Verifier};
 use axum::{
+    body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
     routing::{get, post},
@@ -22,7 +23,7 @@ use axum::{
 };
 use base64::Engine as _;
 use deadpool_postgres::Pool;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use uuid::Uuid;
 
 struct AppState {
@@ -131,14 +132,7 @@ async fn main() {
         max_message_age + max_clock_skew + chrono::Duration::seconds(60),
     ));
 
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/verify", post(verify))
-        .route(
-            "/verify-delegation-signature",
-            post(verify_delegation_signature),
-        )
-        .with_state(state);
+    let app = router(state);
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
@@ -158,6 +152,17 @@ fn env_secs(name: &str, default: i64) -> i64 {
     }
 }
 
+fn router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/verify", post(verify))
+        .route(
+            "/verify-delegation-signature",
+            post(verify_delegation_signature),
+        )
+        .with_state(state)
+}
+
 async fn health() -> &'static str {
     "ok"
 }
@@ -169,17 +174,32 @@ fn authorized(headers: &HeaderMap, expected_secret: &str) -> bool {
         .is_some_and(|v| v == expected_secret)
 }
 
-async fn verify(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(req): Json<VerifyRequest>,
-) -> Result<Json<VerifyResponse>, (StatusCode, String)> {
-    if !authorized(&headers, &state.shared_secret) {
+/// Authenticates the caller first, and only then parses the body. With
+/// axum's `Json` extractor the body would be parsed before the handler runs,
+/// so an unauthenticated caller got a 422 parse error — learning about the
+/// expected request shape and making the service do work — instead of a
+/// plain 401.
+fn authorize_then_parse<T: DeserializeOwned>(
+    headers: &HeaderMap,
+    expected_secret: &str,
+    body: &Bytes,
+) -> Result<T, (StatusCode, String)> {
+    if !authorized(headers, expected_secret) {
         return Err((
             StatusCode::UNAUTHORIZED,
             "invalid or missing x-verifier-secret".into(),
         ));
     }
+    serde_json::from_slice(body)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid JSON body: {e}")))
+}
+
+async fn verify(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<VerifyResponse>, (StatusCode, String)> {
+    let req: VerifyRequest = authorize_then_parse(&headers, &state.shared_secret, &body)?;
     if req.delegation_chain_jws.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -290,14 +310,10 @@ struct VerifyDelegationSignatureResponse {
 async fn verify_delegation_signature(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(req): Json<VerifyDelegationSignatureRequest>,
+    body: Bytes,
 ) -> Result<Json<VerifyDelegationSignatureResponse>, (StatusCode, String)> {
-    if !authorized(&headers, &state.shared_secret) {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            "invalid or missing x-verifier-secret".into(),
-        ));
-    }
+    let req: VerifyDelegationSignatureRequest =
+        authorize_then_parse(&headers, &state.shared_secret, &body)?;
 
     let Ok(unverified) = DelegationToken::from_jws(&req.delegation_jws) else {
         return Ok(Json(VerifyDelegationSignatureResponse {
@@ -340,4 +356,71 @@ async fn verify_delegation_signature(
         reason: None,
         delegation: Some(verified.payload),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    const SECRET: &str = "test-secret";
+
+    fn test_state() -> Arc<AppState> {
+        Arc::new(AppState {
+            // deadpool connects lazily; none of these requests reach the DB.
+            pool: db::build_pool("postgres://nobody@127.0.0.1:1/none"),
+            receipt_signer: LocalSigner::generate(),
+            verifier_id: "verifier:test".into(),
+            audience: "test".into(),
+            shared_secret: SECRET.into(),
+            max_message_age: chrono::Duration::seconds(DEFAULT_MAX_MESSAGE_AGE_SECS),
+            max_clock_skew: chrono::Duration::seconds(DEFAULT_MAX_CLOCK_SKEW_SECS),
+        })
+    }
+
+    async fn status_of(path: &str, secret: Option<&str>, body: &'static str) -> StatusCode {
+        let mut request = Request::post(path).header("content-type", "application/json");
+        if let Some(secret) = secret {
+            request = request.header("x-verifier-secret", secret);
+        }
+        router(test_state())
+            .oneshot(request.body(Body::from(body)).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_requests_get_401_before_the_body_is_parsed() {
+        for path in ["/verify", "/verify-delegation-signature"] {
+            assert_eq!(
+                status_of(path, None, "not json").await,
+                StatusCode::UNAUTHORIZED,
+                "{path} without secret"
+            );
+            assert_eq!(
+                status_of(path, Some("wrong"), "{}").await,
+                StatusCode::UNAUTHORIZED,
+                "{path} with wrong secret"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_malformed_bodies_get_400() {
+        for path in ["/verify", "/verify-delegation-signature"] {
+            assert_eq!(
+                status_of(path, Some(SECRET), "not json").await,
+                StatusCode::BAD_REQUEST,
+                "{path} with garbage body"
+            );
+            assert_eq!(
+                status_of(path, Some(SECRET), "{}").await,
+                StatusCode::BAD_REQUEST,
+                "{path} with missing fields"
+            );
+        }
+    }
 }
