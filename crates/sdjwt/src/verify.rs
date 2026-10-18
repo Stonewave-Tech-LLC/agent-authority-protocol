@@ -11,7 +11,10 @@
 //! 1. The verifier's policy decides the expected shape ([`KeyBinding`]);
 //!    the presentation's shape must match it, never the other way round.
 //! 2. Root: `typ` allowed, `alg` matches the issuer key, signature, `_sd_alg`
-//!    supported, disclosures processed, `exp`/`nbf` valid.
+//!    supported, disclosures processed, `exp`/`nbf` valid. In the
+//!    [`RootForm::DelegatePayload`] form (AP2's user-signed mandates) the
+//!    root's claims are its single disclosed Delegate Payload, exactly as
+//!    for a link.
 //! 3. Each link, in order: `typ` allowed *for its position*, signature by the
 //!    previous element's `cnf` key, exactly one of `sd_hash` /
 //!    `issuer_jwt_hash` matching the previous element (hash of the previous
@@ -22,7 +25,7 @@
 //!    `nonce` equal to the verifier's, `iat` inside the freshness window.
 //!
 //! Format only: what the claims *mean* (constraints, mandate types, status)
-//! is for `aap-core` to evaluate on the `VerifiedChain`.
+//! is for `aap-authority` to evaluate on the `VerifiedChain`.
 
 use serde_json::Value;
 
@@ -91,12 +94,28 @@ pub enum KeyBinding {
     TerminalLink { audience: String, nonce: String },
 }
 
+/// How the Issuer-signed JWT carries its claims. Chosen by the verifier's
+/// policy, like [`KeyBinding`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RootForm {
+    /// The JWT payload is the claim set (an SD-JWT VC user credential).
+    #[default]
+    Credential,
+    /// The JWT payload holds only `delegate_payload` and `_sd_alg`, and the
+    /// claims are its single disclosed element, as in a KB-SD-JWT. This is
+    /// how the AP2 reference SDK issues a user-signed mandate (an open
+    /// mandate, or a human-present closed mandate): there is no separate
+    /// user credential, and the "issuer" key is the user's own key.
+    DelegatePayload,
+}
+
 #[derive(Debug, Clone)]
 pub struct VerifyOptions {
     /// The verifier's clock, seconds since the epoch.
     pub now: i64,
     /// Allowed `typ` values of the Issuer-signed JWT, e.g. `dc+sd-jwt`.
     pub root_typ: Vec<String>,
+    pub root_form: RootForm,
     pub key_binding: KeyBinding,
     /// Clock skew tolerated on `exp` and `nbf`, in seconds.
     pub leeway: i64,
@@ -120,6 +139,7 @@ impl VerifyOptions {
         VerifyOptions {
             now,
             root_typ: vec![root_typ.into()],
+            root_form: RootForm::Credential,
             key_binding,
             leeway: 0,
             max_age: 300,
@@ -174,8 +194,9 @@ impl VerifiedLink {
     }
 
     /// For a link, the processed KB-SD-JWT claims around the Delegate
-    /// Payload (`iat`, `aud`, `nonce`, `sd_hash`/`issuer_jwt_hash`). Empty
-    /// for the root.
+    /// Payload (`iat`, `aud`, `nonce`, `sd_hash`/`issuer_jwt_hash`). For a
+    /// [`RootForm::DelegatePayload`] root, whatever its JWT carries besides
+    /// the Delegate Payload. Empty for a credential root.
     pub fn envelope(&self) -> &Object {
         &self.envelope
     }
@@ -329,7 +350,17 @@ fn verify_root(
     root.jws().check_typ(&allowed)?;
     root.jws().verify(issuer_key)?;
     let sd_alg = SdAlg::of_payload(root.jws().payload())?;
-    let claims = process(root.jws().payload(), root.disclosures(), sd_alg)?.claims;
+    let processed = process(root.jws().payload(), root.disclosures(), sd_alg)?.claims;
+    let (claims, envelope) = match opts.root_form {
+        RootForm::Credential => (processed, Object::new()),
+        RootForm::DelegatePayload => {
+            check_raw_delegate_payload(root.jws().payload())?;
+            let mut envelope = processed;
+            let claims = take_delegate_payload(&mut envelope)?;
+            check_validity(&envelope, opts, false)?;
+            (claims, envelope)
+        }
+    };
     check_validity(&claims, opts, opts.require_exp)?;
     let cnf = read_cnf(&claims, needs_cnf)?;
     Ok(VerifiedLink {
@@ -337,7 +368,7 @@ fn verify_root(
         kind: LinkKind::Root,
         header: root.jws().header().clone(),
         claims,
-        envelope: Object::new(),
+        envelope,
         cnf,
         sd_alg,
         sd_jwt: root.serialize(),
@@ -373,48 +404,10 @@ fn verify_link(
     let aud = single_string(payload, "aud")?;
     let nonce = single_string(payload, "nonce")?;
 
-    // The raw delegate_payload, before disclosures: more than one element
-    // means every element must be a digest.
-    let raw = payload
-        .get("delegate_payload")
-        .and_then(Value::as_array)
-        .filter(|a| !a.is_empty())
-        .ok_or(ErrorKind::DelegatePayload(
-            "missing or not a non-empty array",
-        ))?;
-    if raw.len() > 1 {
-        for item in raw {
-            if element_digest(item)?.is_none() {
-                return Err(ErrorKind::DelegatePayload(
-                    "with several elements, each must be a disclosure digest",
-                ));
-            }
-        }
-    }
-
+    check_raw_delegate_payload(payload)?;
     let sd_alg = SdAlg::of_payload(payload)?;
     let mut envelope = process(payload, element.disclosures(), sd_alg)?.claims;
-    let claims = match envelope.remove("delegate_payload") {
-        Some(Value::Array(items)) => match <[Value; 1]>::try_from(items) {
-            Ok([Value::Object(claims)]) => claims,
-            Ok(_) => {
-                return Err(ErrorKind::DelegatePayload(
-                    "disclosed element is not an object",
-                ))
-            }
-            Err(_) => {
-                return Err(ErrorKind::DelegatePayload(
-                    "exactly one element must be disclosed",
-                ))
-            }
-        },
-        _ => unreachable!("checked above, and processing keeps arrays arrays"),
-    };
-    // "All claims ... except _sd_alg MUST instead be claims in the Delegate
-    // Payload": an _sd_alg in there would look like it applies, and does not.
-    if claims.contains_key("_sd_alg") {
-        return Err(ErrorKind::ReservedName("_sd_alg".into()));
-    }
+    let claims = take_delegate_payload(&mut envelope)?;
 
     let kind = if jws.check_typ(&[typ::KB_SD_JWT]).is_ok() {
         LinkKind::Terminal
@@ -487,6 +480,59 @@ fn verify_kb_jwt(
         header: kb.header().clone(),
         claims: claims.clone(),
     })
+}
+
+/// The raw `delegate_payload`, before disclosures: a non-empty array, and
+/// with more than one element every element must be a digest.
+fn check_raw_delegate_payload(payload: &Object) -> Result<(), ErrorKind> {
+    let raw = payload
+        .get("delegate_payload")
+        .and_then(Value::as_array)
+        .filter(|a| !a.is_empty())
+        .ok_or(ErrorKind::DelegatePayload(
+            "missing or not a non-empty array",
+        ))?;
+    if raw.len() > 1 {
+        for item in raw {
+            if element_digest(item)?.is_none() {
+                return Err(ErrorKind::DelegatePayload(
+                    "with several elements, each must be a disclosure digest",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Removes the processed `delegate_payload` from `envelope` and returns its
+/// single disclosed element.
+fn take_delegate_payload(envelope: &mut Object) -> Result<Object, ErrorKind> {
+    let claims = match envelope.remove("delegate_payload") {
+        Some(Value::Array(items)) => match <[Value; 1]>::try_from(items) {
+            Ok([Value::Object(claims)]) => claims,
+            Ok(_) => {
+                return Err(ErrorKind::DelegatePayload(
+                    "disclosed element is not an object",
+                ))
+            }
+            Err(_) => {
+                return Err(ErrorKind::DelegatePayload(
+                    "exactly one element must be disclosed",
+                ))
+            }
+        },
+        _ => {
+            return Err(ErrorKind::DelegatePayload(
+                "missing or not a non-empty array",
+            ))
+        }
+    };
+    // "All claims ... except _sd_alg MUST instead be claims in the Delegate
+    // Payload": an _sd_alg in there would look like it applies, and does not.
+    if claims.contains_key("_sd_alg") {
+        return Err(ErrorKind::ReservedName("_sd_alg".into()));
+    }
+    Ok(claims)
 }
 
 /// Exactly one of `sd_hash` / `issuer_jwt_hash`, matching the previous

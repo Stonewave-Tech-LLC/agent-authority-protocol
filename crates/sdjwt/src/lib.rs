@@ -5,7 +5,7 @@
 //! correctly signed, correctly chained, correctly disclosed SD-JWT or
 //! Delegate SD-JWT, and hands the claims of every link to the caller as a
 //! [`VerifiedChain`]. What those claims *permit* is decided elsewhere
-//! (`aap-core`), on the `VerifiedChain` only.
+//! (`aap-authority`), on the `VerifiedChain` only.
 //!
 //! Hand-rolled on purpose, like `aap-core`'s JWS: SD-JWT is salted hashes
 //! plus JWS, and a small, auditable trust path matters more than reuse. An
@@ -39,11 +39,12 @@ pub use conceal::SdPayload;
 pub use disclosure::Disclosure;
 pub use error::{Error, ErrorKind, Position};
 pub use hash::SdAlg;
+pub use jws::{sign_jwt, verify_jwt, VerifiedJwt};
 pub use keys::{Algorithm, Signer, SigningKey, VerifyingKey};
 pub use presentation::Presentation;
 pub use sdjwt::{BindingClaims, HashBinding, LinkBuilder, SdJwt, SdJwtBuilder};
 pub use verify::{
-    KeyBinding, LinkKind, Unverified, VerifiedChain, VerifiedKeyBinding, VerifiedLink,
+    KeyBinding, LinkKind, RootForm, Unverified, VerifiedChain, VerifiedKeyBinding, VerifiedLink,
     VerifyOptions,
 };
 
