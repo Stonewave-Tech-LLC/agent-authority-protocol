@@ -8,6 +8,24 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # Throwaway database for the issuer-service integration tests. The tests
+    # create and drop their own databases and roles inside it.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      ISSUER_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # Fail instead of silently skipping if the database is ever missing.
+      ISSUER_TEST_REQUIRE_DB: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -27,3 +45,46 @@ jobs:
 
       - name: Test (workspace)
         run: cargo test --workspace
+
+  # The issuer-service is released as a static musl binary (see
+  # release-issuer.yml). Build it here too, so a musl-specific problem shows
+  # up on the pull request and not on the release tag.
+  issuer-musl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (musl target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl build tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build issuer-service (static musl)
+        run: cargo build --release --target x86_64-unknown-linux-musl -p aap-issuer-service
+
+  # The fuzz targets need nightly and are not part of the workspace; make sure
+  # they keep compiling. (Running them is a manual/scheduled activity.)
+  issuer-fuzz-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (nightly)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/issuer-service/fuzz
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Build fuzz targets
+        run: cd crates/issuer-service && cargo fuzz build
