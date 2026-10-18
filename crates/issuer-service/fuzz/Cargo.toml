@@ -1,0 +1,39 @@
+[package]
+name = "aap-issuer-service-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+aap-issuer-service = { path = ".." }
+
+# Not part of the parent workspace: cargo-fuzz needs nightly and its own lockfile.
+[workspace]
+
+[[bin]]
+name = "auth_data"
+path = "fuzz_targets/auth_data.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "attestation"
+path = "fuzz_targets/attestation.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "assertion"
+path = "fuzz_targets/assertion.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "requests"
+path = "fuzz_targets/requests.rs"
+test = false
+doc = false
