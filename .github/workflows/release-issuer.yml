@@ -1,0 +1,64 @@
+name: Release issuer-service
+
+# Own tag namespace (issuer-v*), mirroring release-verifier.yml: the issuer
+# service is one deployable binary within this repo, not the whole protocol's
+# release. Static musl, so the artifact built on a GitHub runner runs on any
+# Linux host without a glibc version match. The same binary serves staging and
+# production; they differ only in configuration, keys and data.
+
+on:
+  push:
+    tags: ['issuer-v*']
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      ISSUER_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      ISSUER_TEST_REQUIRE_DB: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (musl target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl build tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test before releasing anything
+        run: cargo test --workspace
+
+      - name: Build release binary (static musl)
+        run: cargo build --release --target x86_64-unknown-linux-musl -p aap-issuer-service
+
+      - name: Package
+        run: |
+          cd target/x86_64-unknown-linux-musl/release
+          tar -czf aap-issuer-service-x86_64-unknown-linux-musl.tar.gz aap-issuer-service
+          sha256sum aap-issuer-service-x86_64-unknown-linux-musl.tar.gz > aap-issuer-service-x86_64-unknown-linux-musl.tar.gz.sha256
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/x86_64-unknown-linux-musl/release/aap-issuer-service-x86_64-unknown-linux-musl.tar.gz
+            target/x86_64-unknown-linux-musl/release/aap-issuer-service-x86_64-unknown-linux-musl.tar.gz.sha256

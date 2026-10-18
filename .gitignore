@@ -1,2 +1,5 @@
 /target
 .DS_Store
+/crates/issuer-service/fuzz/target
+/crates/issuer-service/fuzz/corpus
+/crates/issuer-service/fuzz/artifacts
