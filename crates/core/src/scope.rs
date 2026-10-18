@@ -5,7 +5,15 @@
 use chrono::{DateTime, Datelike, Timelike, Utc, Weekday as ChronoWeekday};
 use chrono_tz::Tz;
 
-use crate::types::{ActionRequest, Scope, TimeWindow, Weekday};
+use crate::types::{ActionRequest, Amount, Scope, TimeWindow, Weekday};
+
+/// An amount is only meaningful if it is a finite, non-negative number.
+/// A negative value would otherwise sit "under" every ceiling, and NaN or
+/// infinity can never be compared honestly. Direction of money (refunds,
+/// reversals) belongs in the `action`, never in the sign.
+fn valid_amount(a: &Amount) -> bool {
+    a.value.is_finite() && a.value >= 0.0
+}
 
 fn weekday_matches(w: Weekday, cw: ChronoWeekday) -> bool {
     matches!(
@@ -47,8 +55,13 @@ fn timestamp_in_window(ts: &DateTime<Utc>, window: &TimeWindow) -> bool {
     minute_of_day >= sh * 60 + sm && minute_of_day <= eh * 60 + em
 }
 
-/// Step-by-step per spec/scope-matching.md `matches(scope, request)`.
-pub fn matches(scope: &Scope, request: &ActionRequest) -> bool {
+/// Step-by-step per spec/scope-matching.md `matches(scope, request, now)`.
+///
+/// `now` is the Verifier's own evaluation time. Time windows are checked
+/// against it, never against `request.timestamp`: that field is written and
+/// signed by the agent itself, so trusting it would let an agent claim any
+/// time it likes.
+pub fn matches(scope: &Scope, request: &ActionRequest, now: DateTime<Utc>) -> bool {
     // 1. action allow-list
     if !scope.actions.iter().any(|a| a == &request.action) {
         return false;
@@ -65,7 +78,11 @@ pub fn matches(scope: &Scope, request: &ActionRequest) -> bool {
     // 3. max_amount
     if let Some(max) = &scope.max_amount {
         match &request.amount {
-            Some(amt) if amt.currency == max.currency && amt.value <= max.value => {}
+            Some(amt)
+                if valid_amount(amt)
+                    && valid_amount(max)
+                    && amt.currency == max.currency
+                    && amt.value <= max.value => {}
             _ => return false,
         }
     } else if request.amount.is_some() {
@@ -100,10 +117,7 @@ pub fn matches(scope: &Scope, request: &ActionRequest) -> bool {
 
     // 7. time windows
     if let Some(windows) = &scope.time_windows {
-        if !windows
-            .iter()
-            .any(|w| timestamp_in_window(&request.timestamp, w))
-        {
+        if !windows.iter().any(|w| timestamp_in_window(&now, w)) {
             return false;
         }
     }
@@ -136,7 +150,11 @@ pub fn narrows(parent: &Scope, child: &Scope) -> bool {
     // 3. max_amount
     if let Some(pmax) = &parent.max_amount {
         match &child.max_amount {
-            Some(cmax) if cmax.currency == pmax.currency && cmax.value <= pmax.value => {}
+            Some(cmax)
+                if valid_amount(cmax)
+                    && valid_amount(pmax)
+                    && cmax.currency == pmax.currency
+                    && cmax.value <= pmax.value => {}
             _ => return false,
         }
     }
@@ -222,12 +240,12 @@ mod tests {
         let scope = base_scope();
         let mut req = base_request();
         req.action = "delete_account".into();
-        assert!(!matches(&scope, &req));
+        assert!(!matches(&scope, &req, Utc::now()));
     }
 
     #[test]
     fn allows_action_in_allow_list() {
-        assert!(matches(&base_scope(), &base_request()));
+        assert!(matches(&base_scope(), &base_request(), Utc::now()));
     }
 
     #[test]
@@ -242,7 +260,7 @@ mod tests {
             value: 150.0,
             currency: "EUR".into(),
         });
-        assert!(!matches(&scope, &req));
+        assert!(!matches(&scope, &req, Utc::now()));
     }
 
     #[test]
@@ -257,7 +275,7 @@ mod tests {
             value: 50.0,
             currency: "EUR".into(),
         });
-        assert!(matches(&scope, &req));
+        assert!(matches(&scope, &req, Utc::now()));
     }
 
     #[test]
@@ -268,7 +286,7 @@ mod tests {
             value: 1.0,
             currency: "EUR".into(),
         });
-        assert!(!matches(&scope, &req));
+        assert!(!matches(&scope, &req, Utc::now()));
     }
 
     #[test]
@@ -283,7 +301,7 @@ mod tests {
             value: 1.0,
             currency: "USD".into(),
         });
-        assert!(!matches(&scope, &req));
+        assert!(!matches(&scope, &req, Utc::now()));
     }
 
     #[test]
@@ -295,7 +313,7 @@ mod tests {
         });
         let mut req = base_request();
         req.counterparty = Some("acme".into());
-        assert!(!matches(&scope, &req));
+        assert!(!matches(&scope, &req, Utc::now()));
     }
 
     #[test]
@@ -307,7 +325,7 @@ mod tests {
         });
         let mut req = base_request();
         req.counterparty = Some("someone_else".into());
-        assert!(!matches(&scope, &req));
+        assert!(!matches(&scope, &req, Utc::now()));
     }
 
     #[test]
@@ -379,9 +397,61 @@ mod tests {
     }
 
     #[test]
-    fn time_window_respects_named_timezone() {
+    fn denies_negative_amount_even_though_it_is_under_the_ceiling() {
         let mut scope = base_scope();
-        scope.time_windows = Some(vec![TimeWindow {
+        scope.max_amount = Some(Amount {
+            value: 100.0,
+            currency: "EUR".into(),
+        });
+        let mut req = base_request();
+        req.amount = Some(Amount {
+            value: -5000.0,
+            currency: "EUR".into(),
+        });
+        assert!(!matches(&scope, &req, Utc::now()));
+    }
+
+    #[test]
+    fn denies_non_finite_amounts() {
+        let mut scope = base_scope();
+        scope.max_amount = Some(Amount {
+            value: f64::INFINITY,
+            currency: "EUR".into(),
+        });
+        let mut req = base_request();
+        req.amount = Some(Amount {
+            value: 1.0,
+            currency: "EUR".into(),
+        });
+        assert!(
+            !matches(&scope, &req, Utc::now()),
+            "an infinite ceiling is malformed scope data and must fail closed"
+        );
+    }
+
+    #[test]
+    fn narrows_rejects_negative_child_ceiling() {
+        let parent = Scope {
+            actions: vec!["create_payment".into()],
+            max_amount: Some(Amount {
+                value: 100.0,
+                currency: "EUR".into(),
+            }),
+            ..Default::default()
+        };
+        let child = Scope {
+            actions: vec!["create_payment".into()],
+            max_amount: Some(Amount {
+                value: -1.0,
+                currency: "EUR".into(),
+            }),
+            ..Default::default()
+        };
+        assert!(!narrows(&parent, &child));
+    }
+
+    fn weekday_office_hours_vienna() -> TimeWindow {
+        TimeWindow {
             days: vec![
                 Weekday::Mon,
                 Weekday::Tue,
@@ -392,13 +462,31 @@ mod tests {
             start: "09:00".into(),
             end: "17:00".into(),
             timezone: "Europe/Vienna".into(),
-        }]);
-        let mut req = base_request();
+        }
+    }
+
+    #[test]
+    fn time_window_respects_named_timezone() {
+        let mut scope = base_scope();
+        scope.time_windows = Some(vec![weekday_office_hours_vienna()]);
+        let req = base_request();
         // 2024-01-08 is a Monday. 08:00 UTC = 09:00 CET — right at the boundary, should pass.
-        req.timestamp = Utc.with_ymd_and_hms(2024, 1, 8, 8, 0, 0).unwrap();
-        assert!(matches(&scope, &req));
+        let monday_morning = Utc.with_ymd_and_hms(2024, 1, 8, 8, 0, 0).unwrap();
+        assert!(matches(&scope, &req, monday_morning));
         // 2024-01-08 20:00 UTC = 21:00 CET — outside the window.
-        req.timestamp = Utc.with_ymd_and_hms(2024, 1, 8, 20, 0, 0).unwrap();
-        assert!(!matches(&scope, &req));
+        let monday_evening = Utc.with_ymd_and_hms(2024, 1, 8, 20, 0, 0).unwrap();
+        assert!(!matches(&scope, &req, monday_evening));
+    }
+
+    #[test]
+    fn time_window_ignores_the_agent_supplied_timestamp() {
+        let mut scope = base_scope();
+        scope.time_windows = Some(vec![weekday_office_hours_vienna()]);
+        let mut req = base_request();
+        // The agent claims Monday 10:00 Vienna time...
+        req.timestamp = Utc.with_ymd_and_hms(2024, 1, 8, 9, 0, 0).unwrap();
+        // ...but the Verifier is evaluating on Sunday 2024-01-07, 15:00 Vienna time.
+        let sunday = Utc.with_ymd_and_hms(2024, 1, 7, 14, 0, 0).unwrap();
+        assert!(!matches(&scope, &req, sunday));
     }
 }

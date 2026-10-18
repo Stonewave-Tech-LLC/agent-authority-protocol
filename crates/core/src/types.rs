@@ -108,6 +108,9 @@ pub struct ActionRequest {
     pub counterparty: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_categories: Option<Vec<String>>,
+    /// Informational only: when the agent says it formed this request.
+    /// Never used for authorization — time windows are evaluated against the
+    /// Verifier's own clock, because the agent writes and signs this value.
     pub timestamp: DateTime<Utc>,
 }
 
@@ -133,6 +136,10 @@ pub enum VerificationFailure {
     AudienceMismatch,
     #[error("nonce already used (possible replay)")]
     NonceReplayed,
+    #[error("agent message is too old (issued_at outside the freshness window)")]
+    StaleMessage,
+    #[error("agent message is issued in the future (beyond allowed clock skew)")]
+    MessageFromFuture,
     #[error("delegation not yet valid (valid_from in the future)")]
     NotYetValid,
     #[error("delegation expired")]

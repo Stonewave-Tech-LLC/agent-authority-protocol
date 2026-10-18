@@ -158,6 +158,37 @@ impl NonceStore for PrecomputedNonceStore {
     }
 }
 
+/// Deletes nonces older than `retention`, once a minute, for the lifetime
+/// of the process. Failures are logged and retried on the next tick — a
+/// missed prune only means the table is temporarily larger, never that a
+/// replay gets through (freshness is enforced by verify() itself).
+pub async fn prune_nonces_periodically(pool: Pool, retention: chrono::Duration) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+    loop {
+        tick.tick().await;
+        match prune_nonces(&pool, retention).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!("pruned {n} expired nonces"),
+            Err(e) => tracing::warn!("nonce pruning failed: {e}"),
+        }
+    }
+}
+
+async fn prune_nonces(pool: &Pool, retention: chrono::Duration) -> Result<u64, String> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| format!("db pool error: {e}"))?;
+    let retention_secs = retention.num_seconds() as f64;
+    client
+        .execute(
+            "delete from aap_nonces where seen_at < now() - make_interval(secs => $1)",
+            &[&retention_secs],
+        )
+        .await
+        .map_err(|e| format!("db query error: {e}"))
+}
+
 pub async fn persist_receipt(
     pool: &Pool,
     receipt: &aap_core::Receipt,

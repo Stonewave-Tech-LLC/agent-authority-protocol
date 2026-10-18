@@ -5,7 +5,7 @@
 //! rejection, and every call leaves behind a durable, checkable record of
 //! which one it was.
 
-use chrono::Utc;
+use chrono::{DateTime, Duration, Utc};
 use uuid::Uuid;
 
 use crate::jws::jwk_to_public_key;
@@ -43,7 +43,17 @@ pub struct Verifier<'a, R: KeyResolver, S: StatusChecker, N: NonceStore, SG: Sig
     status: &'a S,
     nonces: &'a N,
     receipt_signer: &'a SG,
+    max_message_age: Duration,
+    max_clock_skew: Duration,
 }
+
+/// How old an AgentMessage may be when it reaches the Verifier. Without a
+/// bound, a signed message stays valid forever and only the nonce store
+/// stands between it and a replay — which then has to remember every nonce
+/// ever seen.
+pub const DEFAULT_MAX_MESSAGE_AGE_SECS: i64 = 300;
+/// How far an agent's clock may run ahead of the Verifier's.
+pub const DEFAULT_MAX_CLOCK_SKEW_SECS: i64 = 60;
 
 impl<'a, R: KeyResolver, S: StatusChecker, N: NonceStore, SG: Signer> Verifier<'a, R, S, N, SG> {
     pub fn new(
@@ -61,7 +71,18 @@ impl<'a, R: KeyResolver, S: StatusChecker, N: NonceStore, SG: Signer> Verifier<'
             status,
             nonces,
             receipt_signer,
+            max_message_age: Duration::seconds(DEFAULT_MAX_MESSAGE_AGE_SECS),
+            max_clock_skew: Duration::seconds(DEFAULT_MAX_CLOCK_SKEW_SECS),
         }
+    }
+
+    /// Overrides the default freshness window for `AgentMessage.issued_at`.
+    /// A nonce store only needs to remember nonces for `max_age + max_skew`:
+    /// anything older is rejected as stale before the nonce is consulted.
+    pub fn with_message_freshness(mut self, max_age: Duration, max_skew: Duration) -> Self {
+        self.max_message_age = max_age;
+        self.max_clock_skew = max_skew;
+        self
     }
 
     /// `delegation_chain_jws` is ordered leaf-first: index 0 is the
@@ -73,8 +94,21 @@ impl<'a, R: KeyResolver, S: StatusChecker, N: NonceStore, SG: Signer> Verifier<'
         delegation_chain_jws: &[&str],
         agent_message_jws: &str,
     ) -> VerificationOutcome {
-        let decision = self.verify_inner(delegation_chain_jws, agent_message_jws);
-        let receipt = self.issue_receipt(delegation_chain_jws, agent_message_jws, &decision);
+        self.verify_at(delegation_chain_jws, agent_message_jws, Utc::now())
+    }
+
+    /// Same as `verify`, evaluated at an explicit point in time. Every time
+    /// check in the flow (delegation validity, message freshness, scope time
+    /// windows, the receipt's `decided_at`) uses this one `now`, so a
+    /// decision is reproducible and testable.
+    pub fn verify_at(
+        &self,
+        delegation_chain_jws: &[&str],
+        agent_message_jws: &str,
+        now: DateTime<Utc>,
+    ) -> VerificationOutcome {
+        let decision = self.verify_inner(delegation_chain_jws, agent_message_jws, now);
+        let receipt = self.issue_receipt(delegation_chain_jws, agent_message_jws, &decision, now);
         VerificationOutcome { decision, receipt }
     }
 
@@ -82,6 +116,7 @@ impl<'a, R: KeyResolver, S: StatusChecker, N: NonceStore, SG: Signer> Verifier<'
         &self,
         delegation_chain_jws: &[&str],
         agent_message_jws: &str,
+        now: DateTime<Utc>,
     ) -> Result<VerifiedAction, VerificationFailure> {
         if delegation_chain_jws.is_empty() {
             return Err(VerificationFailure::ChainBroken("empty chain".into()));
@@ -113,7 +148,6 @@ impl<'a, R: KeyResolver, S: StatusChecker, N: NonceStore, SG: Signer> Verifier<'
                 .verify_signature(&signer_key)
                 .map_err(|_| VerificationFailure::InvalidDelegationSignature)?;
 
-            let now = Utc::now();
             if now < verified.payload.valid_from {
                 return Err(VerificationFailure::NotYetValid);
             }
@@ -133,6 +167,22 @@ impl<'a, R: KeyResolver, S: StatusChecker, N: NonceStore, SG: Signer> Verifier<'
             if child.parent_delegation_id != Some(parent.delegation_id) {
                 return Err(VerificationFailure::ChainBroken(
                     "parent_delegation_id does not match the next link".into(),
+                ));
+            }
+            // The principal is fixed by the root. A link restating a different
+            // principal would let a sub-delegating agent claim to act for
+            // someone else — exactly the misattribution this protocol exists
+            // to prevent.
+            if child.principal_id != parent.principal_id
+                || child.principal_type != parent.principal_type
+            {
+                return Err(VerificationFailure::ChainBroken(
+                    "sub-delegation names a different principal than its parent".into(),
+                ));
+            }
+            if child.valid_from < parent.valid_from || child.valid_until > parent.valid_until {
+                return Err(VerificationFailure::ChainBroken(
+                    "sub-delegation is valid outside its parent's validity period".into(),
                 ));
             }
             if !parent.can_delegate {
@@ -167,6 +217,12 @@ impl<'a, R: KeyResolver, S: StatusChecker, N: NonceStore, SG: Signer> Verifier<'
                 "agent_id in message does not match the leaf delegation".into(),
             ));
         }
+        if verified_msg.payload.issued_at > now + self.max_clock_skew {
+            return Err(VerificationFailure::MessageFromFuture);
+        }
+        if verified_msg.payload.issued_at < now - self.max_message_age {
+            return Err(VerificationFailure::StaleMessage);
+        }
         if self
             .nonces
             .seen_and_record(&verified_msg.payload.agent_id, &verified_msg.payload.nonce)
@@ -174,7 +230,7 @@ impl<'a, R: KeyResolver, S: StatusChecker, N: NonceStore, SG: Signer> Verifier<'
             return Err(VerificationFailure::NonceReplayed);
         }
 
-        if !scope::matches(&leaf.scope, &verified_msg.payload.request) {
+        if !scope::matches(&leaf.scope, &verified_msg.payload.request, now) {
             return Err(VerificationFailure::ScopeDenied);
         }
 
@@ -189,6 +245,7 @@ impl<'a, R: KeyResolver, S: StatusChecker, N: NonceStore, SG: Signer> Verifier<'
         delegation_chain_jws: &[&str],
         agent_message_jws: &str,
         decision: &Result<VerifiedAction, VerificationFailure>,
+        now: DateTime<Utc>,
     ) -> IssuedReceipt {
         let (delegation_ids, agent_id, outcome): (Vec<Uuid>, String, ReceiptOutcome) =
             match decision {
@@ -237,7 +294,7 @@ impl<'a, R: KeyResolver, S: StatusChecker, N: NonceStore, SG: Signer> Verifier<'
             delegation_ids,
             request_digest: digest_request(agent_message_jws),
             outcome,
-            decided_at: Utc::now(),
+            decided_at: now,
         };
 
         let jws = self

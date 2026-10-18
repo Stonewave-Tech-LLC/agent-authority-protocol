@@ -12,6 +12,7 @@ mod db;
 use std::sync::Arc;
 
 use aap_core::token::{AgentMessageToken, DelegationToken};
+use aap_core::verifier::{DEFAULT_MAX_CLOCK_SKEW_SECS, DEFAULT_MAX_MESSAGE_AGE_SECS};
 use aap_core::{LocalSigner, Verifier};
 use axum::{
     extract::State,
@@ -30,6 +31,8 @@ struct AppState {
     verifier_id: String,
     audience: String,
     shared_secret: String,
+    max_message_age: chrono::Duration,
+    max_clock_skew: chrono::Duration,
 }
 
 #[derive(Deserialize)]
@@ -73,6 +76,14 @@ async fn main() {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(8500);
+    let max_message_age = chrono::Duration::seconds(env_secs(
+        "AAP_VERIFIER_MAX_MESSAGE_AGE_SECS",
+        DEFAULT_MAX_MESSAGE_AGE_SECS,
+    ));
+    let max_clock_skew = chrono::Duration::seconds(env_secs(
+        "AAP_VERIFIER_MAX_CLOCK_SKEW_SECS",
+        DEFAULT_MAX_CLOCK_SKEW_SECS,
+    ));
 
     // AAP_VERIFIER_RECEIPT_SIGNING_KEY: base64url (no padding) of a raw
     // 32-byte Ed25519 seed. Kept as a stable, persisted key (not
@@ -108,7 +119,17 @@ async fn main() {
         verifier_id,
         audience,
         shared_secret,
+        max_message_age,
+        max_clock_skew,
     });
+
+    // Nonces only need to outlive the freshness window (plus a minute of
+    // margin): any message older than that is rejected as stale before its
+    // nonce is ever consulted, so keeping older rows protects nothing.
+    tokio::spawn(db::prune_nonces_periodically(
+        state.pool.clone(),
+        max_message_age + max_clock_skew + chrono::Duration::seconds(60),
+    ));
 
     let app = Router::new()
         .route("/health", get(health))
@@ -124,6 +145,17 @@ async fn main() {
         .unwrap_or_else(|e| panic!("failed to bind 127.0.0.1:{port}: {e}"));
     tracing::info!("aap-verifier-service listening on 127.0.0.1:{port}");
     axum::serve(listener, app).await.expect("server error");
+}
+
+fn env_secs(name: &str, default: i64) -> i64 {
+    match std::env::var(name) {
+        Ok(v) => v
+            .parse()
+            .ok()
+            .filter(|s: &i64| *s > 0)
+            .unwrap_or_else(|| panic!("{name} must be a positive number of seconds, got {v:?}")),
+        Err(_) => default,
+    }
 }
 
 async fn health() -> &'static str {
@@ -205,7 +237,8 @@ async fn verify(
         &status,
         &nonces,
         &state.receipt_signer,
-    );
+    )
+    .with_message_freshness(state.max_message_age, state.max_clock_skew);
     let chain_refs: Vec<&str> = req
         .delegation_chain_jws
         .iter()
