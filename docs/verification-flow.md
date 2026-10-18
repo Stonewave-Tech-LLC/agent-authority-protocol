@@ -12,11 +12,11 @@ A Verifier is anything checking whether an incoming request is backed by real au
 1. **Resolve the Principal's public key.** Via a `Resolver` (interface, not a concrete choice — v1 ships a centralized JSON/SQLite-backed resolver; a DID-based resolver can be swapped in later without touching anything below).
 2. **Verify the Delegation's signature** against that public key. Reject if invalid.
 3. **Verify the Agent message's signature** against `delegation.agent_public_key`. Reject if invalid.
-4. **Check `audience` and `nonce`.** The signed request payload must name this specific Verifier as `audience` and carry a fresh `nonce`. Reject replays (nonce already seen) and reject requests aimed at a different audience presented here (confused-deputy protection — a valid signed request for Verifier A must not be accepted by Verifier B).
+4. **Check `audience`, freshness and `nonce`.** The signed request payload must name this specific Verifier as `audience`, its `issued_at` must lie within the freshness window (default: at most 5 minutes old, at most 60 seconds in the future), and it must carry a `nonce` not seen before. Because stale messages are rejected first, a nonce store only has to remember nonces for the length of the freshness window. Reject replays (nonce already seen) and reject requests aimed at a different audience presented here (confused-deputy protection — a valid signed request for Verifier A must not be accepted by Verifier B).
 5. **Check time validity.** `valid_from <= now <= valid_until`. Reject otherwise.
 6. **Check revocation status.** Call `delegation.status_endpoint` (or local cache with a short TTL). Reject if revoked or unreachable-and-policy-says-fail-closed.
-7. **If `delegation.parent_delegation_id` is set (sub-delegation):** recursively verify the parent delegation (steps 1-6), and check `narrows(parentScope, delegation.scope)` (see `scope-matching.md`). Reject if the chain doesn't hold or exceeds `max_delegation_depth`.
-8. **Check scope.** `matches(delegation.scope, requestedAction)`. Reject otherwise.
+7. **If `delegation.parent_delegation_id` is set (sub-delegation):** recursively verify the parent delegation (steps 1-6), and check `narrows(parentScope, delegation.scope)` (see `scope-matching.md`). The child must name the same `principal_id` and `principal_type` as its parent, and its validity period must lie within the parent's. Reject if the chain doesn't hold or exceeds `max_delegation_depth`.
+8. **Check scope.** `matches(delegation.scope, requestedAction, now)`, evaluated at the Verifier's own time. Reject otherwise.
 9. **Accept.** Optionally emit a `Receipt`/`AuditEvent` (signed record of what was checked and the outcome) for the audit trail.
 
 Steps 4-8 are pure/deterministic — no model in the loop. Step 1 and 6 are the only I/O.

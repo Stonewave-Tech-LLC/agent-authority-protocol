@@ -1,7 +1,8 @@
 mod keystore;
 mod server;
 
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::PathBuf;
 
 use aap_core::{delegation, DelegationParams, LocalSigner, PrincipalType, Scope};
@@ -11,7 +12,10 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "aap-admin",
-    about = "Principal-side tooling: holds Neo's AAP principal key locally, signs device Delegations."
+    about = "Principal-side tooling: holds Neo's AAP principal key locally, signs device Delegations.",
+    long_about = "Principal-side tooling: holds Neo's AAP principal key locally, signs device Delegations.
+
+                  Assurance level AL0: the key is a software key on the same machine your agents run on.                   Use it for development and automation only, never for delegations that carry real liability."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -48,16 +52,90 @@ enum PairingAction {
     Finalize { id: String },
 }
 
-/// Reads a passphrase from the terminal without echoing it. If
-/// AAP_ADMIN_PASSPHRASE is set, uses that instead of prompting — meant for
-/// scripted/CI use only (rpassword itself opens /dev/tty directly, so it
-/// simply cannot work in a context with no controlling terminal at all).
-/// Interactive prompting (the secure default) is untouched for normal use.
+/// Reads a passphrase from the terminal without echoing it. There is
+/// deliberately no environment-variable shortcut: any process running as
+/// the user — including a coding agent with shell access — can read the
+/// environment, and a passphrase sitting there unlocks the principal key
+/// for whoever finds it.
 fn get_passphrase(prompt: &str) -> String {
-    if let Ok(p) = std::env::var("AAP_ADMIN_PASSPHRASE") {
-        return p;
-    }
     rpassword::prompt_password(prompt).expect("failed to read passphrase")
+}
+
+/// Asks a yes/no question on the terminal device itself, not on stdin.
+/// stdin is whatever the caller pipes in: `echo y | aap-admin pairing sign`
+/// would let any process approve a delegation on the user's behalf. Reading
+/// the terminal raises that bar but does not remove it — a process can
+/// still drive a pseudo-terminal — which is why this CLI is AL0 only.
+fn confirm_on_terminal(prompt: &str) -> bool {
+    #[cfg(windows)]
+    let (input_path, output_path) = ("CONIN$", "CONOUT$");
+    #[cfg(not(windows))]
+    let (input_path, output_path) = ("/dev/tty", "/dev/tty");
+
+    let no_terminal = "no interactive terminal available — refusing to sign without a confirmation typed by a human";
+    let mut output = OpenOptions::new()
+        .write(true)
+        .open(output_path)
+        .expect(no_terminal);
+    let input = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(input_path)
+        .expect(no_terminal);
+
+    write!(output, "{prompt}").ok();
+    output.flush().ok();
+    let mut answer = String::new();
+    BufReader::new(input)
+        .read_line(&mut answer)
+        .expect("failed to read confirmation from the terminal");
+    answer.trim().eq_ignore_ascii_case("y")
+}
+
+/// Human-readable lines for a Scope, rendered locally from the parsed
+/// structure. The server's raw JSON is never shown as the thing being
+/// approved: whoever controls the server would control what the user reads.
+fn render_scope(scope: &Scope) -> Vec<String> {
+    let mut lines = vec![format!("actions:          {}", scope.actions.join(", "))];
+    lines.push(match &scope.resources {
+        Some(r) => format!("resources:        {}", r.join(", ")),
+        None => "resources:        ANY resource".to_string(),
+    });
+    lines.push(match &scope.max_amount {
+        Some(a) => format!("max amount:       {:.2} {} per action", a.value, a.currency),
+        None => "max amount:       none (requests carrying an amount are denied)".to_string(),
+    });
+    if let Some(cps) = &scope.counterparties {
+        if let Some(allow) = &cps.allow {
+            lines.push(format!("counterparties:   only {}", allow.join(", ")));
+        }
+        if let Some(deny) = &cps.deny {
+            lines.push(format!("never with:       {}", deny.join(", ")));
+        }
+    }
+    if let Some(dc) = &scope.data_categories {
+        lines.push(format!("data categories:  {}", dc.join(", ")));
+    }
+    match &scope.time_windows {
+        Some(windows) => {
+            for w in windows {
+                let days: Vec<String> = w
+                    .days
+                    .iter()
+                    .map(|d| format!("{d:?}").to_lowercase())
+                    .collect();
+                lines.push(format!(
+                    "time window:      {} {}–{} ({})",
+                    days.join(","),
+                    w.start,
+                    w.end,
+                    w.timezone
+                ));
+            }
+        }
+        None => lines.push("time window:      any time".to_string()),
+    }
+    lines
 }
 
 fn pending_delegation_path(id: &str) -> PathBuf {
@@ -186,20 +264,28 @@ fn cmd_pairing_sign(id: &str) {
         std::process::exit(1);
     };
 
+    let scope: Scope =
+        serde_json::from_value(request.requested_scope.clone()).unwrap_or_else(|e| {
+            eprintln!("Requested scope is not a valid Scope object: {e}");
+            std::process::exit(1);
+        });
+
     println!("Pairing request {}:", request.id);
-    println!("  device:         {}", request.device_label);
-    println!("  requested agent_id: {}", request.requested_agent_id);
-    println!("  public key:     {:?}", request.public_key);
-    println!("  requested scope: {}", request.requested_scope);
+    println!("  device:           {}", request.device_label);
+    println!("  agent_id:         {}", request.requested_agent_id);
+    println!(
+        "  device key:       {} {} x={}",
+        request.public_key.kty, request.public_key.crv, request.public_key.x
+    );
+    println!("  valid for:        365 days");
+    println!("  may sub-delegate: no");
+    for line in render_scope(&scope) {
+        println!("  {line}");
+    }
     println!();
-    print!("Sign a Delegation for this device with these exact parameters? [y/N] ");
-    use std::io::Write as _;
-    std::io::stdout().flush().ok();
-    let mut confirm = String::new();
-    std::io::stdin()
-        .read_line(&mut confirm)
-        .expect("failed to read confirmation");
-    if confirm.trim().to_lowercase() != "y" {
+    if !confirm_on_terminal(
+        "Sign a Delegation for this device with exactly these parameters? [y/N] ",
+    ) {
         println!("Aborted — nothing signed.");
         return;
     }
@@ -226,12 +312,6 @@ fn cmd_pairing_sign(id: &str) {
             std::process::exit(1);
         }
     };
-
-    let scope: Scope =
-        serde_json::from_value(request.requested_scope.clone()).unwrap_or_else(|e| {
-            eprintln!("Requested scope is not a valid Scope object: {e}");
-            std::process::exit(1);
-        });
 
     let issued = delegation::issue(
         &principal_signer,

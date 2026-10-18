@@ -1,9 +1,9 @@
-use chrono::{Duration, Utc};
+use chrono::{Datelike, Duration, TimeZone, Utc};
 
 use aap_core::{
-    delegation, message, receipt::ReceiptOutcome, ActionRequest, DelegationParams,
+    delegation, message, receipt::ReceiptOutcome, ActionRequest, AgentMessage, DelegationParams,
     InMemoryNonceStore, InMemoryRegistry, InMemoryStatus, LocalSigner, PrincipalType, Scope,
-    Signer, VerificationFailure, Verifier,
+    Signer, TimeWindow, VerificationFailure, Verifier, Weekday,
 };
 
 struct Fixture {
@@ -497,4 +497,254 @@ fn rejects_sub_delegation_when_parent_forbids_delegation() {
         outcome.decision,
         Err(VerificationFailure::ChainBroken(_))
     ));
+}
+
+// --- Regression tests for the v0 hardening (M0) ---------------------------
+
+fn sign_message_issued_at(f: &Fixture, issued_at: chrono::DateTime<Utc>) -> String {
+    let payload = AgentMessage {
+        agent_id: "agent:wave-1".into(),
+        audience: "bank-api".into(),
+        nonce: uuid::Uuid::new_v4().to_string(),
+        issued_at,
+        request: payment_request(10.0),
+    };
+    f.agent_signer.sign_payload(&payload).unwrap()
+}
+
+/// Next Sunday, 14:00 UTC (15:00 or 16:00 in Vienna) — strictly in the
+/// future, so a delegation issued now is already valid then.
+fn next_sunday_afternoon() -> chrono::DateTime<Utc> {
+    let now = Utc::now();
+    let days_ahead = 7 - i64::from(now.weekday().num_days_from_sunday());
+    (now + Duration::days(days_ahead))
+        .date_naive()
+        .and_hms_opt(14, 0, 0)
+        .unwrap()
+        .and_utc()
+}
+
+#[test]
+fn time_window_is_checked_against_the_verifiers_clock_not_the_agents_claim() {
+    let f = setup();
+    let mut scope = payment_scope(500.0);
+    scope.time_windows = Some(vec![TimeWindow {
+        days: vec![Weekday::Mon],
+        start: "09:00".into(),
+        end: "17:00".into(),
+        timezone: "Europe/Vienna".into(),
+    }]);
+    let del = delegation::issue(
+        &f.principal_signer,
+        DelegationParams {
+            valid_for: Duration::days(9),
+            can_delegate: false,
+            max_delegation_depth: None,
+            ..delegation_params(&f, scope)
+        },
+    )
+    .unwrap();
+
+    // Every request claims to be formed on a Monday at 10:00 Vienna time.
+    let signed_at = |issued_at: chrono::DateTime<Utc>| {
+        let mut request = payment_request(10.0);
+        request.timestamp = Utc.with_ymd_and_hms(2024, 1, 8, 9, 0, 0).unwrap();
+        let payload = AgentMessage {
+            agent_id: "agent:wave-1".into(),
+            audience: "bank-api".into(),
+            nonce: uuid::Uuid::new_v4().to_string(),
+            issued_at,
+            request,
+        };
+        f.agent_signer.sign_payload(&payload).unwrap()
+    };
+
+    // Evaluated on a Sunday: the claim must not help.
+    let sunday = next_sunday_afternoon();
+    let outcome = verifier(&f).verify_at(&[&del.jws], &signed_at(sunday), sunday);
+    assert!(
+        matches!(outcome.decision, Err(VerificationFailure::ScopeDenied)),
+        "expected ScopeDenied on Sunday, got {:?}",
+        outcome.decision.err()
+    );
+
+    // Evaluated on the following Monday, 08:00 UTC (09:00/10:00 Vienna): accepted.
+    let monday = sunday + Duration::hours(18);
+    let outcome = verifier(&f).verify_at(&[&del.jws], &signed_at(monday), monday);
+    assert!(
+        outcome.decision.is_ok(),
+        "expected accept on Monday morning, got {:?}",
+        outcome.decision.err()
+    );
+}
+
+#[test]
+fn rejects_negative_amount_under_a_ceiling() {
+    let f = setup();
+    let del = issue_basic_delegation(&f, payment_scope(100.0));
+    let msg = message::issue(
+        &f.agent_signer,
+        "agent:wave-1",
+        "bank-api",
+        payment_request(-5000.0),
+    )
+    .unwrap();
+
+    let outcome = verifier(&f).verify(&[&del.jws], &msg.jws);
+
+    assert!(matches!(
+        outcome.decision,
+        Err(VerificationFailure::ScopeDenied)
+    ));
+}
+
+#[test]
+fn rejects_a_stale_message() {
+    let f = setup();
+    let del = issue_basic_delegation(&f, payment_scope(500.0));
+    let stale = sign_message_issued_at(&f, Utc::now() - Duration::minutes(10));
+
+    let outcome = verifier(&f).verify(&[&del.jws], &stale);
+
+    assert!(matches!(
+        outcome.decision,
+        Err(VerificationFailure::StaleMessage)
+    ));
+}
+
+#[test]
+fn rejects_a_message_from_the_future() {
+    let f = setup();
+    let del = issue_basic_delegation(&f, payment_scope(500.0));
+    let future = sign_message_issued_at(&f, Utc::now() + Duration::minutes(10));
+
+    let outcome = verifier(&f).verify(&[&del.jws], &future);
+
+    assert!(matches!(
+        outcome.decision,
+        Err(VerificationFailure::MessageFromFuture)
+    ));
+}
+
+#[test]
+fn freshness_window_is_configurable() {
+    let f = setup();
+    let del = issue_basic_delegation(&f, payment_scope(500.0));
+    let ten_minutes_old = sign_message_issued_at(&f, Utc::now() - Duration::minutes(10));
+
+    let outcome = verifier(&f)
+        .with_message_freshness(Duration::minutes(15), Duration::seconds(30))
+        .verify(&[&del.jws], &ten_minutes_old);
+
+    assert!(
+        outcome.decision.is_ok(),
+        "expected accept, got {:?}",
+        outcome.decision.err()
+    );
+}
+
+fn delegation_params(f: &Fixture, scope: Scope) -> DelegationParams {
+    DelegationParams {
+        principal_id: "principal:neo".into(),
+        principal_type: PrincipalType::NaturalPerson,
+        agent_id: "agent:wave-1".into(),
+        agent_public_key: f.agent_signer.public_jwk(),
+        scope,
+        valid_for: Duration::hours(1),
+        status_endpoint: "https://example.org/status".into(),
+        can_delegate: true,
+        max_delegation_depth: Some(2),
+        parent_delegation_id: None,
+        metadata: None,
+    }
+}
+
+fn sub_delegation_params(
+    sub_agent: &LocalSigner,
+    root: &delegation::IssuedDelegation,
+) -> DelegationParams {
+    DelegationParams {
+        principal_id: "principal:neo".into(),
+        principal_type: PrincipalType::NaturalPerson,
+        agent_id: "agent:wave-1-sub".into(),
+        agent_public_key: sub_agent.public_jwk(),
+        scope: payment_scope(100.0),
+        valid_for: Duration::minutes(30),
+        status_endpoint: "https://example.org/status".into(),
+        can_delegate: false,
+        max_delegation_depth: None,
+        parent_delegation_id: Some(root.payload.delegation_id),
+        metadata: None,
+    }
+}
+
+#[test]
+fn rejects_sub_delegation_that_rewrites_the_principal() {
+    let f = setup();
+    let sub_agent = LocalSigner::generate();
+    let root = delegation::issue(
+        &f.principal_signer,
+        delegation_params(&f, payment_scope(500.0)),
+    )
+    .unwrap();
+    let sub = delegation::issue(
+        &f.agent_signer,
+        DelegationParams {
+            principal_id: "principal:someone-else".into(),
+            principal_type: PrincipalType::LegalEntity,
+            ..sub_delegation_params(&sub_agent, &root)
+        },
+    )
+    .unwrap();
+    let msg = message::issue(
+        &sub_agent,
+        "agent:wave-1-sub",
+        "bank-api",
+        payment_request(50.0),
+    )
+    .unwrap();
+
+    let outcome = verifier(&f).verify(&[&sub.jws, &root.jws], &msg.jws);
+
+    match outcome.decision {
+        Err(VerificationFailure::ChainBroken(reason)) => {
+            assert!(reason.contains("different principal"), "{reason}")
+        }
+        other => panic!("expected ChainBroken, got {:?}", other.err()),
+    }
+}
+
+#[test]
+fn rejects_sub_delegation_that_outlives_its_parent() {
+    let f = setup();
+    let sub_agent = LocalSigner::generate();
+    let root = delegation::issue(
+        &f.principal_signer,
+        delegation_params(&f, payment_scope(500.0)),
+    )
+    .unwrap();
+    let sub = delegation::issue(
+        &f.agent_signer,
+        DelegationParams {
+            valid_for: Duration::days(3650),
+            ..sub_delegation_params(&sub_agent, &root)
+        },
+    )
+    .unwrap();
+    let msg = message::issue(
+        &sub_agent,
+        "agent:wave-1-sub",
+        "bank-api",
+        payment_request(50.0),
+    )
+    .unwrap();
+
+    let outcome = verifier(&f).verify(&[&sub.jws, &root.jws], &msg.jws);
+
+    match outcome.decision {
+        Err(VerificationFailure::ChainBroken(reason)) => {
+            assert!(reason.contains("validity period"), "{reason}")
+        }
+        other => panic!("expected ChainBroken, got {:?}", other.err()),
+    }
 }

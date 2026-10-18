@@ -17,7 +17,7 @@ cargo run -p aap-demo-cli
 Runs a scripted end-to-end scenario: a Principal issues a Delegation, an in-scope request gets accepted, an over-the-ceiling request gets rejected, a replayed message gets rejected, and a revoked delegation gets rejected — all decided by [`crates/core/src/verifier.rs`](crates/core/src/verifier.rs), never by an LLM. Every one of those decisions, accept or reject, also comes back as a signed [`Receipt`](crates/core/src/receipt.rs) — a durable, independently checkable record of what was decided and why.
 
 ```bash
-cargo test --workspace   # 25 tests: scope matching, full verification flow, sub-delegation chains, receipts
+cargo test --workspace   # 41 tests: scope matching, full verification flow, sub-delegation chains, receipts, freshness
 ```
 
 The core crate (`aap-core`) is written in Rust rather than the originally-considered TypeScript specifically because of a compile-time guarantee TS's structural typing can't give: a typestate pattern (`crates/core/src/token.rs`) makes `Unverified` and `Verified` delegations/messages distinct Rust types. The only way to obtain a `Verified` token is a successful `verify_signature()` call — a function that grants authority cannot even compile if it accepts an unverified token.
