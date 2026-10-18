@@ -1,0 +1,20 @@
+{
+  "iss": "https://pid-issuer.bund.de.example",
+  "iat": 1683000000,
+  "exp": 1883000000,
+  "vct": "urn:eudi:pid:de:1",
+  "cnf": {
+    "jwk": {
+      "kty": "EC",
+      "crv": "P-256",
+      "x": "TCAER19Zvu3OHF4j4W4vfSVoHIP1ILilDls7vCeGemc",
+      "y": "ZxjiWWbZMQGHVWKVQ4hbSIirsVfuecCE6t4jT9F2HZQ"
+    }
+  },
+  "age_equal_or_over": {
+    "18": true
+  },
+  "nationalities": [
+    "DE"
+  ]
+}
