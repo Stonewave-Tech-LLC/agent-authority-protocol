@@ -157,6 +157,53 @@ pub(crate) fn sign<S: Signer + ?Sized>(
     Ok(format!("{signing_input}.{}", B64.encode(sig)))
 }
 
+/// A compact JWS checked against a key the caller chose: a merchant's
+/// checkout JWT, a Mandate Receipt. Not part of a presentation, so there is
+/// no position and no disclosure processing.
+#[derive(Debug, Clone)]
+pub struct VerifiedJwt {
+    header: Object,
+    claims: Object,
+}
+
+impl VerifiedJwt {
+    pub fn header(&self) -> &Object {
+        &self.header
+    }
+
+    pub fn claims(&self) -> &Object {
+        &self.claims
+    }
+}
+
+/// Verifies a standalone compact JWS with the same checks as every element
+/// of a presentation: `typ` in `allowed_typ`, `alg` pinned to `key`, no
+/// `crit`, signature.
+pub fn verify_jwt(
+    jwt: &str,
+    key: &VerifyingKey,
+    allowed_typ: &[&str],
+) -> Result<VerifiedJwt, crate::Error> {
+    let jws = Jws::parse(jwt)?;
+    jws.check_typ(allowed_typ)?;
+    jws.verify(key)?;
+    Ok(VerifiedJwt {
+        header: jws.header,
+        claims: jws.payload,
+    })
+}
+
+/// Signs a standalone compact JWS (e.g. a Mandate Receipt). `header` may add
+/// parameters such as `kid`; `alg` and `typ` are set here.
+pub fn sign_jwt<S: Signer + ?Sized>(
+    typ: &str,
+    header: &Object,
+    claims: &Object,
+    signer: &S,
+) -> Result<String, crate::Error> {
+    Ok(sign(typ, header, claims, signer)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

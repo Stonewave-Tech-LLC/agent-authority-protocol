@@ -114,6 +114,7 @@ pub struct SdJwtBuilder {
     payload: SdPayload,
     header: Object,
     sd_alg: SdAlg,
+    delegate_form: bool,
 }
 
 impl SdJwtBuilder {
@@ -126,6 +127,22 @@ impl SdJwtBuilder {
             payload: SdPayload::new(claims),
             header: Object::new(),
             sd_alg: SdAlg::Sha256,
+            delegate_form: false,
+        }
+    }
+
+    /// A root whose payload is a Delegate Payload, the way AP2 issues a
+    /// user-signed mandate: the JWT carries only `delegate_payload` (one
+    /// digest) and `_sd_alg`, and `payload` travels as an array-element
+    /// disclosure. Verify it with [`crate::RootForm::DelegatePayload`].
+    /// `conceal` and `decoys` pointers are relative to `payload`.
+    pub fn delegate_form(typ: impl Into<String>, payload: SdPayload) -> Self {
+        SdJwtBuilder {
+            typ: typ.into(),
+            payload,
+            header: Object::new(),
+            sd_alg: SdAlg::Sha256,
+            delegate_form: true,
         }
     }
 
@@ -154,7 +171,16 @@ impl SdJwtBuilder {
     /// Signs the JWT and returns the SD-JWT with every disclosure, as the
     /// Issuer hands it to the Holder.
     pub fn sign<S: Signer + ?Sized>(self, signer: &S) -> Result<SdJwt, Error> {
-        let (mut payload, disclosures) = self.payload.build(self.sd_alg)?;
+        let (mut payload, mut disclosures) = self.payload.build(self.sd_alg)?;
+        if self.delegate_form {
+            let wrapper = Disclosure::new_element(Value::Object(payload));
+            payload = Object::new();
+            payload.insert(
+                "delegate_payload".into(),
+                json!([{ "...": wrapper.digest(self.sd_alg) }]),
+            );
+            disclosures.insert(0, wrapper);
+        }
         payload.insert("_sd_alg".into(), self.sd_alg.name().into());
         let jwt = jws::sign(&self.typ, &self.header, &payload, signer)?;
         Ok(SdJwt {

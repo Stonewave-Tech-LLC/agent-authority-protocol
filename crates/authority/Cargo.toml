@@ -1,0 +1,17 @@
+[package]
+name = "aap-authority"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "AAP v1 authorization: constraint types (AAP and AP2), cumulative evaluation over Delegate SD-JWT chains, and Mandate Receipts. Accepts only an aap-sdjwt VerifiedChain."
+
+[dependencies]
+aap-sdjwt = { path = "../sdjwt" }
+serde_json.workspace = true
+base64.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest = "1"
