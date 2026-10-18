@@ -296,6 +296,7 @@ pub struct Enrollment<'a> {
     pub pop_thumbprint: Option<String>,
     pub pop_challenge: Option<String>,
     pub pop_key_id: Option<String>,
+    pub pop_purpose: Option<String>,
     /// Thumbprint mixed into clientDataHash (defaults to the real one).
     pub cdh_thumbprint: Option<[u8; 32]>,
 }
@@ -317,6 +318,7 @@ impl<'a> Enrollment<'a> {
             pop_thumbprint: None,
             pop_challenge: None,
             pop_key_id: None,
+            pop_purpose: None,
             cdh_thumbprint: None,
         }
     }
@@ -328,6 +330,7 @@ impl<'a> Enrollment<'a> {
         let cdh = client_data_hash(&self.challenge, &tp);
         let att = attestation(self.pki, self.app, &cdh, &self.opts);
         let pop = self.pop_signer.unwrap_or(self.principal).sign(&json!({
+            "purpose": self.pop_purpose.clone().unwrap_or_else(|| "aap-enrollment-pop/v1".into()),
             "challenge": self.pop_challenge.clone().unwrap_or_else(|| B64.encode(&self.challenge)),
             "key_id": self.pop_key_id.clone().unwrap_or_else(|| self.app.key_id_b64()),
             "jwk_thumbprint": self.pop_thumbprint.clone().unwrap_or_else(|| B64.encode(self.principal.thumbprint())),

@@ -440,6 +440,12 @@ async fn every_enrollment_rejection_path_is_closed() {
                 "key_id_mismatch",
                 Box::new(|e, _| e.pop_key_id = Some(AppAttestDevice::new().key_id_b64())),
             ),
+            (
+                "PoP with a different purpose (e.g. a mandate signature)",
+                "pop_rejected",
+                "purpose_mismatch",
+                Box::new(|e, _| e.pop_purpose = Some("aap-mandate".into())),
+            ),
         ];
         for (name, error, reason, tweak) in &cases {
             let (app, principal) = (AppAttestDevice::new(), Principal::new());
@@ -588,11 +594,47 @@ async fn assertions_bind_mandates_and_counters_only_move_forward() {
             .await;
         assert_eq!(s, StatusCode::NOT_FOUND);
 
-        // Replay of counter 1: valid signature, counter did not advance -> flagged.
+        // Replay of the old counter-1 assertion (e.g. by a merchant who saw it):
+        // rejected, but the device must stay usable.
         let (s, v) = api.assert_req(&device, &d1, &assertion(&app, 1, &d1)).await;
         assert_eq!(
             (s, v["error"].as_str()),
-            (StatusCode::CONFLICT, Some("counter_replay"))
+            (StatusCode::CONFLICT, Some("assertion_replay"))
+        );
+        let status_of = || async {
+            db.owner
+                .query_one("select status from devices where device_id = $1", &[&did])
+                .await
+                .unwrap()
+                .get::<_, String>(0)
+        };
+        assert_eq!(
+            status_of().await,
+            "active",
+            "a replay must not lock the user out"
+        );
+        assert_eq!(
+            counter().await,
+            2,
+            "a rejected assertion never moves the counter"
+        );
+
+        // The device keeps working after the replay.
+        let d3 = mandate_digest(b"mandate three");
+        let (s, v) = api
+            .assert_req(&device, &d3, &assertion(&app, 10, &d3))
+            .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+
+        // A second, different assertion with the accepted counter 10 is
+        // impossible for an honest key: flagged.
+        let d4 = mandate_digest(b"mandate four");
+        let (s, v) = api
+            .assert_req(&device, &d4, &assertion(&app, 10, &d4))
+            .await;
+        assert_eq!(
+            (s, v["error"].as_str()),
+            (StatusCode::CONFLICT, Some("counter_conflict"))
         );
         let st = db
             .owner
@@ -604,12 +646,7 @@ async fn assertions_bind_mandates_and_counters_only_move_forward() {
             .unwrap();
         assert_eq!(
             (st.get::<_, String>(0), st.get::<_, String>(1)),
-            ("flagged".into(), "counter_replay".into())
-        );
-        assert_eq!(
-            counter().await,
-            2,
-            "a rejected assertion never moves the counter"
+            ("flagged".into(), "counter_conflict".into())
         );
         let n: i64 = db
             .owner
@@ -623,9 +660,9 @@ async fn assertions_bind_mandates_and_counters_only_move_forward() {
         assert_eq!(n, 1);
 
         // A flagged device is refused, even with a perfectly good assertion.
-        let d3 = mandate_digest(b"mandate three");
+        let d5 = mandate_digest(b"mandate five");
         let (s, v) = api
-            .assert_req(&device, &d3, &assertion(&app, 10, &d3))
+            .assert_req(&device, &d5, &assertion(&app, 11, &d5))
             .await;
         assert_eq!(
             (s, v["error"].as_str()),
@@ -642,12 +679,37 @@ async fn assertions_bind_mandates_and_counters_only_move_forward() {
             .await
             .unwrap()
             .get(0);
-        assert_eq!(n, 2);
+        assert_eq!(n, 3);
     });
 }
 
 #[tokio::test]
-async fn an_equal_counter_is_a_replay_too() {
+async fn a_verbatim_replay_of_the_last_assertion_does_not_flag() {
+    db_test!(db, {
+        let pki = Pki::new();
+        let api = Api::new(&db, &pki, &[]);
+        let (device, _, app) = api.enroll(&pki, Opts::default()).await;
+        let d = mandate_digest(b"m");
+        let a = assertion(&app, 4, &d);
+        assert_eq!(api.assert_req(&device, &d, &a).await.0, StatusCode::OK);
+        let (s, v) = api.assert_req(&device, &d, &a).await;
+        assert_eq!(
+            (s, v["error"].as_str()),
+            (StatusCode::CONFLICT, Some("assertion_replay"))
+        );
+        let d2 = mandate_digest(b"next");
+        assert_eq!(
+            api.assert_req(&device, &d2, &assertion(&app, 5, &d2))
+                .await
+                .0,
+            StatusCode::OK,
+            "device still active after a verbatim replay"
+        );
+    });
+}
+
+#[tokio::test]
+async fn an_equal_counter_with_a_different_payload_flags_the_device() {
     db_test!(db, {
         let pki = Pki::new();
         let api = Api::new(&db, &pki, &[]);
@@ -661,7 +723,7 @@ async fn an_equal_counter_is_a_replay_too() {
         let (s, v) = api.assert_req(&device, &d2, &assertion(&app, 4, &d2)).await;
         assert_eq!(
             (s, v["error"].as_str()),
-            (StatusCode::CONFLICT, Some("counter_replay"))
+            (StatusCode::CONFLICT, Some("counter_conflict"))
         );
     });
 }

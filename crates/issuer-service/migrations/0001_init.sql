@@ -21,6 +21,10 @@ create table devices (
     app_id                text not null,
     environment           text not null check (environment in ('development', 'production')),
     counter               bigint not null default 0 check (counter between 0 and 4294967295),
+    -- Digest bound by the assertion that set `counter`. Lets a verbatim replay
+    -- (harmless) be told apart from a second, different assertion with the
+    -- same counter (impossible for an honest key: flag the device).
+    last_payload_digest   bytea check (octet_length(last_payload_digest) = 32),
     status                text not null default 'active' check (status in ('active', 'flagged', 'revoked')),
     flagged_at            timestamptz,
     flagged_reason        text,
@@ -72,7 +76,7 @@ revoke all on users, devices, enrollment_challenges, audit_events from public;
 grant usage on schema public to {{app_role}};
 grant select, insert on users to {{app_role}};
 grant select, insert on devices to {{app_role}};
-grant update (counter, status, flagged_at, flagged_reason, last_assertion_at) on devices to {{app_role}};
+grant update (counter, last_payload_digest, status, flagged_at, flagged_reason, last_assertion_at) on devices to {{app_role}};
 grant select, insert, delete on enrollment_challenges to {{app_role}};
 grant update (consumed_at) on enrollment_challenges to {{app_role}};
 grant select, insert on audit_events to {{app_role}};

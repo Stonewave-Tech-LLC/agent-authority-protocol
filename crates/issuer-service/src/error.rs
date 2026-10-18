@@ -21,7 +21,15 @@ pub enum ApiError {
     UnknownDevice,
     DeviceNotActive,
     AlreadyEnrolled,
-    CounterReplay,
+    /// A validly signed assertion that is not newer than the last accepted one:
+    /// a verbatim replay or a stale, reordered submission. Rejected, but it
+    /// does not flag the device: anyone who has seen an assertion could
+    /// otherwise lock the user out by replaying it.
+    AssertionReplay,
+    /// A second, different assertion carrying the counter that was already
+    /// accepted. An honest App Attest key never produces this: the device is
+    /// flagged.
+    CounterConflict,
     RateLimited,
     Internal,
 }
@@ -34,7 +42,9 @@ impl ApiError {
             ApiError::Rejected { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             ApiError::UnknownDevice => StatusCode::NOT_FOUND,
             ApiError::DeviceNotActive => StatusCode::FORBIDDEN,
-            ApiError::AlreadyEnrolled | ApiError::CounterReplay => StatusCode::CONFLICT,
+            ApiError::AlreadyEnrolled | ApiError::AssertionReplay | ApiError::CounterConflict => {
+                StatusCode::CONFLICT
+            }
             ApiError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             ApiError::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -49,7 +59,8 @@ impl ApiError {
             ApiError::UnknownDevice => "unknown_device",
             ApiError::DeviceNotActive => "device_not_active",
             ApiError::AlreadyEnrolled => "already_enrolled",
-            ApiError::CounterReplay => "counter_replay",
+            ApiError::AssertionReplay => "assertion_replay",
+            ApiError::CounterConflict => "counter_conflict",
             ApiError::RateLimited => "rate_limited",
             ApiError::Internal => "internal",
         }

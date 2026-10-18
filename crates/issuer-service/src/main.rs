@@ -130,9 +130,20 @@ async fn serve() -> i32 {
     let state = Arc::new(http::AppState::new(pool, config));
     let shutdown = async {
         let ctrl_c = tokio::signal::ctrl_c();
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("install SIGTERM handler");
-        tokio::select! { _ = ctrl_c => {}, _ = term.recv() => {} }
+        // SIGTERM is how PM2/systemd stop the service; on non-Unix development
+        // machines Ctrl-C is the only shutdown signal (keeps the workspace
+        // building on Windows).
+        #[cfg(unix)]
+        {
+            let mut term =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("install SIGTERM handler");
+            tokio::select! { _ = ctrl_c => {}, _ = term.recv() => {} }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = ctrl_c.await;
+        }
     };
     match http::serve(listener, state, shutdown).await {
         Ok(()) => 0,

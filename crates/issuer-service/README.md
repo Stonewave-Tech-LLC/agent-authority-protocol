@@ -40,8 +40,9 @@ All bodies are JSON. Errors are `{"error": "<code>"}` with an optional
 }
 ```
 
-The `pop_jws` payload is exactly `{"challenge": "<b64url>", "key_id": "<as above>",
-"jwk_thumbprint": "<b64url RFC 7638 thumbprint>"}`. The attestation's
+The `pop_jws` payload is exactly `{"purpose": "aap-enrollment-pop/v1", "challenge": "<b64url>",
+"key_id": "<as above>", "jwk_thumbprint": "<b64url RFC 7638 thumbprint>"}`. The fixed
+`purpose` separates this signature from mandates signed with the same key. The attestation's
 `clientDataHash` must be `SHA256(challenge || thumbprint)` (raw bytes).
 
 Checks, in order: strict parsing; challenge consumed atomically (a failed
@@ -60,10 +61,18 @@ are created in one transaction.
 Verifies the signature over `SHA256(authenticatorData || payload_digest)` and
 the rpIdHash, then advances the stored counter with a single conditional
 `UPDATE`. A validly signed assertion whose counter is not strictly greater than
-the stored one is a replay or a cloned key: the request gets `409
-counter_replay` and the device is flagged; a flagged device gets `403
-device_not_active` from then on. **Clients must send assertions in counter
-order** (one at a time): a reordered pair looks like a replay.
+the stored one is rejected:
+
+* a verbatim replay, or an older assertion submitted late, gets `409
+  assertion_replay`. The device is **not** flagged, because anyone who has seen
+  an assertion (a merchant, a log reader) could otherwise lock the user out;
+* a *different* assertion carrying the counter that was already accepted gets
+  `409 counter_conflict` and flags the device. An honest App Attest key never
+  produces two assertions with the same counter. A flagged device gets `403
+  device_not_active` from then on.
+
+Clients should send assertions in counter order: a later assertion that
+arrives first makes the earlier one stale.
 
 Verified assertions are written to the audit log with the payload digest and
 counter.

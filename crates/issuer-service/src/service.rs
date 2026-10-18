@@ -82,10 +82,16 @@ struct EnrollRequest {
     pop_jws: String,
 }
 
+/// Domain separation for the proof of possession: the principal key also
+/// signs mandates, so the PoP must name what it is and can never be mistaken
+/// for (or replayed as) anything else.
+pub const POP_PURPOSE: &str = "aap-enrollment-pop/v1";
+
 /// The proof-of-possession payload the principal key signs.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PopPayload {
+    purpose: String,
     challenge: String,
     key_id: String,
     jwk_thumbprint: String,
@@ -236,6 +242,9 @@ pub fn verify_enrollment_at(
         jws::JwsError::BadSignature => pop_err("signature"),
         _ => pop_err("malformed"),
     })?;
+    if pop.purpose != POP_PURPOSE {
+        return Err(pop_err("purpose_mismatch"));
+    }
     let thumb_b64 = B64.encode(req.jwk.thumbprint);
     if pop.jwk_thumbprint != thumb_b64 {
         return Err(pop_err("thumbprint_mismatch"));
@@ -433,9 +442,13 @@ pub async fn verify_assertion(
     let tx = client.transaction().await?;
     let advanced = tx
         .execute(
-            "update devices set counter = $2, last_assertion_at = now()
+            "update devices set counter = $2, last_payload_digest = $3, last_assertion_at = now()
              where device_id = $1 and status = 'active' and counter < $2",
-            &[&req.device_id, &(new_counter as i64)],
+            &[
+                &req.device_id,
+                &(new_counter as i64),
+                &&req.payload_digest[..],
+            ],
         )
         .await?;
     if advanced == 1 {
@@ -461,33 +474,54 @@ pub async fn verify_assertion(
         });
     }
 
-    // A validly signed assertion whose counter did not advance: a replay or a
-    // cloned key. Flag the device so nothing more is accepted from it.
+    // A validly signed assertion whose counter did not advance. Only a second,
+    // *different* assertion with the counter already accepted proves misuse of
+    // the key: that flags the device. A verbatim replay or a stale assertion
+    // is merely rejected, otherwise anyone who has seen one assertion (a
+    // merchant, a log reader) could lock the user out by replaying it.
     let flagged = tx
         .execute(
             "update devices
-             set status = 'flagged', flagged_at = now(), flagged_reason = 'counter_replay'
-             where device_id = $1 and status = 'active' and counter >= $2",
-            &[&req.device_id, &(new_counter as i64)],
+             set status = 'flagged', flagged_at = now(), flagged_reason = 'counter_conflict'
+             where device_id = $1 and status = 'active' and counter = $2
+               and last_payload_digest is distinct from $3",
+            &[
+                &req.device_id,
+                &(new_counter as i64),
+                &&req.payload_digest[..],
+            ],
         )
         .await?;
-    if flagged == 1 {
-        audit(
-            &*tx,
-            "device_flagged",
-            Some(user_id),
-            Some(req.device_id),
-            json!({ "reason": "counter_replay", "presented_counter": new_counter }),
-        )
-        .await?;
-    }
-    tx.commit().await?;
-    tracing::warn!(device_id = %req.device_id, presented_counter = new_counter, "assertion counter did not advance");
-    if flagged == 1 {
-        Err(ApiError::CounterReplay)
+    let (event, result) = if flagged == 1 {
+        ("device_flagged", Err(ApiError::CounterConflict))
     } else {
-        Err(ApiError::DeviceNotActive)
-    }
+        let still_active = tx
+            .query_opt(
+                "select 1 from devices where device_id = $1 and status = 'active'",
+                &[&req.device_id],
+            )
+            .await?
+            .is_some();
+        if still_active {
+            ("assertion_replay_rejected", Err(ApiError::AssertionReplay))
+        } else {
+            ("assertion_rejected", Err(ApiError::DeviceNotActive))
+        }
+    };
+    audit(
+        &*tx,
+        event,
+        Some(user_id),
+        Some(req.device_id),
+        json!({
+            "reason": if flagged == 1 { "counter_conflict" } else { "counter_not_advanced" },
+            "presented_counter": new_counter,
+        }),
+    )
+    .await?;
+    tx.commit().await?;
+    tracing::warn!(device_id = %req.device_id, presented_counter = new_counter, flagged = flagged == 1, "assertion counter did not advance");
+    result
 }
 
 // -------------------------------------------------------------------- audit
