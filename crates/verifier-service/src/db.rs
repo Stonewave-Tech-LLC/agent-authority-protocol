@@ -107,19 +107,6 @@ pub fn row_belongs_to(stored_jws: Option<&str>, presented_jws: &str) -> bool {
     stored_jws == Some(presented_jws)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::row_belongs_to;
-
-    #[test]
-    fn a_row_only_vouches_for_its_own_token() {
-        assert!(row_belongs_to(Some("a.b.c"), "a.b.c"));
-        // A child that copied a sibling's delegation_id presents another JWS.
-        assert!(!row_belongs_to(Some("a.b.c"), "x.y.z"));
-        assert!(!row_belongs_to(None, "a.b.c"));
-    }
-}
-
 /// Atomically checks-and-records (agent_id, nonce) against aap_nonces
 /// *before* verify() runs, then hands verify() a `PrecomputedNonceStore`
 /// that just replays this one precomputed answer for that exact pair.
@@ -254,4 +241,17 @@ pub async fn persist_receipt(
         .await
         .map_err(|e| format!("failed to persist receipt: {e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::row_belongs_to;
+
+    #[test]
+    fn a_row_only_vouches_for_its_own_token() {
+        assert!(row_belongs_to(Some("a.b.c"), "a.b.c"));
+        // A child that copied a sibling's delegation_id presents another JWS.
+        assert!(!row_belongs_to(Some("a.b.c"), "x.y.z"));
+        assert!(!row_belongs_to(None, "a.b.c"));
+    }
 }
