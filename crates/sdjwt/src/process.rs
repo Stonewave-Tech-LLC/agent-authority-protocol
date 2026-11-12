@@ -30,6 +30,14 @@ use crate::hash::SdAlg;
 use crate::jws::Object;
 use crate::pointer::{Path, Segment};
 
+/// How deeply the processed payload may nest, counting objects, arrays and
+/// disclosures nested inside disclosures. serde_json limits each JSON text
+/// to 128 levels, but disclosures can nest inside each other without limit:
+/// a few hundred kilobytes of chained disclosures, signed by any agent with
+/// a delegated key, overflowed the stack of a verifier thread. Mandates
+/// nest a handful of levels; 64 leaves ample room.
+pub(crate) const MAX_DEPTH: usize = 64;
+
 pub(crate) struct Processed {
     /// The Processed SD-JWT Payload, top-level `_sd_alg` removed.
     pub claims: Object,
@@ -91,6 +99,11 @@ impl Walker<'_> {
     }
 
     fn value(&mut self, value: &Value, path: &mut Path) -> Result<Value, ErrorKind> {
+        // `path` has one segment per level of nesting, disclosures included,
+        // so it bounds the recursion below.
+        if path.len() > MAX_DEPTH {
+            return Err(ErrorKind::Malformed("payload nests too deeply"));
+        }
         Ok(match value {
             Value::Object(o) => Value::Object(self.object(o, path)?),
             Value::Array(a) => Value::Array(self.array(a, path)?),
@@ -224,6 +237,41 @@ mod tests {
         assert_eq!(
             run(payload, &[&fr]).err(),
             Some(ErrorKind::UnreferencedDisclosure)
+        );
+    }
+
+    /// `levels` property disclosures, each nested in the previous one.
+    fn nested(levels: usize) -> (Value, Vec<Disclosure>) {
+        let mut disclosures = Vec::with_capacity(levels);
+        let mut inner = json!(1);
+        for _ in 0..levels {
+            let d = Disclosure::new_property("n", inner);
+            inner = json!({"_sd": [digest(&d)]});
+            disclosures.push(d);
+        }
+        (inner, disclosures)
+    }
+
+    #[test]
+    fn nesting_is_bounded_without_exhausting_the_stack() {
+        let (payload, discs) = nested(MAX_DEPTH);
+        assert!(process(payload.as_object().unwrap(), &discs, SdAlg::Sha256).is_ok());
+
+        let (payload, discs) = nested(MAX_DEPTH + 2);
+        assert_eq!(
+            process(payload.as_object().unwrap(), &discs, SdAlg::Sha256).err(),
+            Some(ErrorKind::Malformed("payload nests too deeply"))
+        );
+
+        // Deep enough to overflow a 2 MB thread stack before the limit.
+        let (payload, discs) = nested(20_000);
+        let handle = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || process(payload.as_object().unwrap(), &discs, SdAlg::Sha256).err())
+            .unwrap();
+        assert_eq!(
+            handle.join().unwrap(),
+            Some(ErrorKind::Malformed("payload nests too deeply"))
         );
     }
 

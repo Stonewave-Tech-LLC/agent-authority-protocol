@@ -340,6 +340,12 @@ impl ExecutionDate {
             Some(s) => instant_range(s)
                 .ok_or_else(|| violated(format!("execution_date {s:?} is not an ISO 8601 date")))?,
         };
+        // A date already over cannot be "executed then": a processor would
+        // run it now, possibly after not_after has passed. Five minutes of
+        // leeway for an instant written just before the presentation.
+        if end < now - EXECUTION_DATE_LEEWAY {
+            return Err(violated("execution date is in the past"));
+        }
         if self.not_before.is_some_and(|nb| start < nb) {
             return Err(violated("execution date is before the allowed window"));
         }
@@ -366,6 +372,9 @@ impl ExecutionDate {
 
 /// An RFC 3339 date-time is one instant; a bare `YYYY-MM-DD` date is the
 /// whole UTC day, first to last second.
+/// How far in the past an `execution_date` instant may lie, in seconds.
+const EXECUTION_DATE_LEEWAY: i64 = 300;
+
 fn instant_range(s: &str) -> Option<(i64, i64)> {
     if let Ok(t) = DateTime::parse_from_rfc3339(s) {
         let t = t.timestamp();

@@ -523,7 +523,9 @@ impl<'a> Verifier<'a> {
                 let store = self
                     .nonces
                     .ok_or_else(|| Reason::NonceStore("no nonce store configured".into()))?;
-                match store.check_and_insert(nonce, iat + self.policy.max_age, now) {
+                // Freshness accepts iat + max_age itself, and the store drops
+                // entries at their expiry, so keep the nonce one second longer.
+                match store.check_and_insert(nonce, iat + self.policy.max_age + 1, now) {
                     Ok(true) => {}
                     Ok(false) => return Err(Reason::Replay),
                     Err(e) => return Err(Reason::NonceStore(e.to_string())),
@@ -595,9 +597,14 @@ fn hiding_only_narrows(pointer: &str) -> bool {
     }
 }
 
-/// The usage counter of an open mandate: hash of its JWT, which does not
-/// change with the disclosures a presentation selects.
+/// The usage counter of an open mandate: hash of its JWS signing input
+/// (`header.payload`), which does not change with the disclosures a
+/// presentation selects. Not the whole JWT: ES256 signatures are malleable
+/// (`s` and `n - s` both verify, and Secure Enclave keys produce high-S
+/// signatures, so they cannot be refused), so hashing the signature let an
+/// agent re-encode the user's mandate and start its budget from zero.
 fn ledger_key(link: &VerifiedLink) -> String {
     let jwt = link.sd_jwt().split('~').next().unwrap_or_default();
-    SdAlg::Sha256.digest(jwt)
+    let signing_input = jwt.rsplit_once('.').map_or(jwt, |(input, _)| input);
+    SdAlg::Sha256.digest(signing_input)
 }
