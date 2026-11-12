@@ -748,3 +748,92 @@ fn rejects_sub_delegation_that_outlives_its_parent() {
         other => panic!("expected ChainBroken, got {:?}", other.err()),
     }
 }
+
+/// Review 2026-11, finding H1: the root grants no money at all (no
+/// `max_amount`), the sub-delegating agent gives its child a huge ceiling.
+#[test]
+fn rejects_sub_delegation_that_adds_a_money_ceiling_the_root_never_granted() {
+    let f = setup();
+    let sub_agent = LocalSigner::generate();
+    let root_scope = Scope {
+        actions: vec!["create_payment".into()],
+        ..Default::default()
+    };
+    let root = delegation::issue(&f.principal_signer, delegation_params(&f, root_scope)).unwrap();
+    let sub = delegation::issue(
+        &f.agent_signer,
+        DelegationParams {
+            scope: payment_scope(1_000_000_000.0),
+            ..sub_delegation_params(&sub_agent, &root)
+        },
+    )
+    .unwrap();
+    let msg = message::issue(
+        &sub_agent,
+        "agent:wave-1-sub",
+        "bank-api",
+        payment_request(999_999_999.0),
+    )
+    .unwrap();
+
+    let outcome = verifier(&f).verify(&[&sub.jws, &root.jws], &msg.jws);
+
+    assert!(
+        matches!(outcome.decision, Err(VerificationFailure::ScopeNotNarrowed)),
+        "expected ScopeNotNarrowed, got {:?}",
+        outcome.decision.err()
+    );
+}
+
+fn every_day_utc(start: &str, end: &str) -> TimeWindow {
+    TimeWindow {
+        days: vec![
+            Weekday::Mon,
+            Weekday::Tue,
+            Weekday::Wed,
+            Weekday::Thu,
+            Weekday::Fri,
+            Weekday::Sat,
+            Weekday::Sun,
+        ],
+        start: start.into(),
+        end: end.into(),
+        timezone: "UTC".into(),
+    }
+}
+
+/// Review 2026-11, finding H2: `00:00-00:1439` passed `narrows` against a
+/// one-hour parent window but matched the whole day.
+#[test]
+fn rejects_sub_delegation_whose_window_uses_out_of_range_minutes() {
+    let f = setup();
+    let sub_agent = LocalSigner::generate();
+    let mut root_scope = payment_scope(500.0);
+    root_scope.time_windows = Some(vec![every_day_utc("00:00", "01:00")]);
+    let root = delegation::issue(&f.principal_signer, delegation_params(&f, root_scope)).unwrap();
+    let mut child_scope = payment_scope(100.0);
+    child_scope.time_windows = Some(vec![every_day_utc("00:00", "00:1439")]);
+    let sub = delegation::issue(
+        &f.agent_signer,
+        DelegationParams {
+            scope: child_scope,
+            ..sub_delegation_params(&sub_agent, &root)
+        },
+    )
+    .unwrap();
+    let msg = message::issue(
+        &sub_agent,
+        "agent:wave-1-sub",
+        "bank-api",
+        payment_request(50.0),
+    )
+    .unwrap();
+
+    let outcome = verifier(&f).verify(&[&sub.jws, &root.jws], &msg.jws);
+
+    assert!(
+        matches!(outcome.decision, Err(VerificationFailure::ScopeNotNarrowed)),
+        "expected ScopeNotNarrowed, got {:?}",
+        outcome.decision.err()
+    );
+}

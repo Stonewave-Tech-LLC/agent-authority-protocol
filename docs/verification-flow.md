@@ -16,7 +16,7 @@ A Verifier is anything checking whether an incoming request is backed by real au
 5. **Check time validity.** `valid_from <= now <= valid_until`. Reject otherwise.
 6. **Check revocation status.** Call `delegation.status_endpoint` (or local cache with a short TTL). Reject if revoked or unreachable-and-policy-says-fail-closed.
 7. **If `delegation.parent_delegation_id` is set (sub-delegation):** recursively verify the parent delegation (steps 1-6), and check `narrows(parentScope, delegation.scope)` (see `scope-matching.md`). The child must name the same `principal_id` and `principal_type` as its parent, and its validity period must lie within the parent's. Reject if the chain doesn't hold or exceeds `max_delegation_depth`.
-8. **Check scope.** `matches(delegation.scope, requestedAction, now)`, evaluated at the Verifier's own time. Reject otherwise.
+8. **Check scope.** `matches(scope, requestedAction, now)` for the scope of **every** delegation in the chain, leaf to root, evaluated at the Verifier's own time. Reject if any link's scope denies the request. Checking only the leaf would make `narrows` the sole barrier against widening.
 9. **Accept.** Optionally emit a `Receipt`/`AuditEvent` (signed record of what was checked and the outcome) for the audit trail.
 
 Steps 4-8 are pure/deterministic — no model in the loop. Step 1 and 6 are the only I/O.
