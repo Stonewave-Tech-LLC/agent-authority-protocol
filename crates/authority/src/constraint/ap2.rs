@@ -340,10 +340,19 @@ impl ExecutionDate {
             Some(s) => instant_range(s)
                 .ok_or_else(|| violated(format!("execution_date {s:?} is not an ISO 8601 date")))?,
         };
+        // A date already over cannot be "executed then": a processor would
+        // run it now, possibly after not_after has passed. Five minutes of
+        // leeway for an instant written just before the presentation.
+        if end < now - EXECUTION_DATE_LEEWAY {
+            return Err(violated("execution date is in the past"));
+        }
         if self.not_before.is_some_and(|nb| start < nb) {
             return Err(violated("execution date is before the allowed window"));
         }
-        if self.not_after.is_some_and(|na| end > na) {
+        // The leeway only forgives a date written a moment ago; it never
+        // extends the window. Whatever the date says, execution happens
+        // now at the earliest, so `now` must also be inside `not_after`.
+        if self.not_after.is_some_and(|na| end.max(now) > na) {
             return Err(violated("execution date is after the allowed window"));
         }
         Ok(())
@@ -363,6 +372,9 @@ impl ExecutionDate {
         nb && na
     }
 }
+
+/// How far in the past an `execution_date` instant may lie, in seconds.
+const EXECUTION_DATE_LEEWAY: i64 = 300;
 
 /// An RFC 3339 date-time is one instant; a bare `YYYY-MM-DD` date is the
 /// whole UTC day, first to last second.
