@@ -13,6 +13,12 @@
 //! Alongside the processed payload it records, for every disclosure, the
 //! path at which its value landed. The holder uses those paths to turn
 //! "disclose /address/region" into a set of disclosures.
+//!
+//! It also records where something was left out: the path of every object
+//! or array that held a digest no presented disclosure matched. RFC 9901
+//! lets a holder omit any concealed claim, and an omitted claim cannot be
+//! told apart from a decoy. A policy layer that reads the processed claims
+//! needs that record to know "nothing restricting was hidden here".
 
 use std::collections::{HashMap, HashSet};
 
@@ -29,6 +35,10 @@ pub(crate) struct Processed {
     pub claims: Object,
     /// `paths[i]` is where `disclosures[i]`'s value sits in `claims`.
     pub paths: Vec<Path>,
+    /// The object or array, by path in `claims`, of every digest that no
+    /// presented disclosure matched (an undisclosed claim or a decoy). One
+    /// entry per such digest, in document order.
+    pub undisclosed: Vec<Path>,
 }
 
 pub(crate) fn process(
@@ -47,6 +57,7 @@ pub(crate) fn process(
         by_digest,
         seen: HashSet::new(),
         paths: vec![None; disclosures.len()],
+        undisclosed: Vec::new(),
     };
     let mut claims = walker.object(payload, &mut Vec::new())?;
     claims.remove("_sd_alg");
@@ -55,7 +66,11 @@ pub(crate) fn process(
         .into_iter()
         .map(|p| p.ok_or(ErrorKind::UnreferencedDisclosure))
         .collect::<Result<_, _>>()?;
-    Ok(Processed { claims, paths })
+    Ok(Processed {
+        claims,
+        paths,
+        undisclosed: walker.undisclosed,
+    })
 }
 
 struct Walker<'a> {
@@ -63,6 +78,7 @@ struct Walker<'a> {
     by_digest: HashMap<String, usize>,
     seen: HashSet<String>,
     paths: Vec<Option<Path>>,
+    undisclosed: Vec<Path>,
 }
 
 impl Walker<'_> {
@@ -99,7 +115,9 @@ impl Walker<'_> {
         for digest in digests {
             let digest = digest.as_str().ok_or(ErrorKind::InvalidClaim("_sd"))?;
             let Some(i) = self.lookup(digest)? else {
-                continue; // undisclosed claim or decoy
+                // Undisclosed claim or decoy: dropped, but remembered.
+                self.undisclosed.push(path.clone());
+                continue;
             };
             let disclosure = &self.disclosures[i];
             let name = disclosure.name().ok_or_else(|| {
@@ -135,6 +153,9 @@ impl Walker<'_> {
                         }
                         self.paths[i] = Some(path.clone());
                         out.push(self.value(disclosure.value(), path)?);
+                    } else {
+                        // Undisclosed element or decoy: record the array.
+                        self.undisclosed.push(path[..path.len() - 1].to_vec());
                     }
                 }
                 None => out.push(self.value(item, path)?),
@@ -191,6 +212,12 @@ mod tests {
         assert_eq!(
             p.paths[1],
             vec![Segment::Key("nationalities".into()), Segment::Index(0)]
+        );
+        // DE was left out of the array, and the top-level decoy matched
+        // nothing: both locations are recorded.
+        assert_eq!(
+            p.undisclosed,
+            vec![vec![Segment::Key("nationalities".into())], vec![]]
         );
 
         // FR without its parent cannot connect to the payload.

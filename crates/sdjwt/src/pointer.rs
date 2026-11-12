@@ -15,6 +15,16 @@ pub(crate) enum Segment {
 /// so each segment is known to be an object key or an array index.
 pub(crate) type Path = Vec<Segment>;
 
+/// Renders `path` as a JSON Pointer (RFC 6901); the empty path is `""`.
+pub(crate) fn to_pointer(path: &[Segment]) -> String {
+    path.iter()
+        .map(|s| match s {
+            Segment::Key(k) => format!("/{}", k.replace('~', "~0").replace('/', "~1")),
+            Segment::Index(i) => format!("/{i}"),
+        })
+        .collect()
+}
+
 /// Parses `pointer` and resolves it against `doc`. The empty pointer (the
 /// whole document) is rejected: neither concealing nor disclosing "the
 /// document itself" means anything.
