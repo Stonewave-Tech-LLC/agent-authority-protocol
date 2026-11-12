@@ -28,9 +28,21 @@ fn weekday_matches(w: Weekday, cw: ChronoWeekday) -> bool {
     )
 }
 
-fn parse_hm(s: &str) -> Option<(u32, u32)> {
-    let (h, m) = s.split_once(':')?;
-    Some((h.parse().ok()?, m.parse().ok()?))
+/// Parses a strict 24-hour `HH:MM` (the pattern in `scope.schema.json`) into
+/// minutes since midnight. Anything else, such as `9:00`, `16:120`, `24:00`
+/// or `+1:00`, is `None`. A lenient parser would let a window like
+/// `00:00-00:1439` look like "the first minutes after midnight" to a human
+/// and to `narrows`, while covering the whole day.
+fn parse_hm(s: &str) -> Option<u32> {
+    let b = s.as_bytes();
+    if b.len() != 5 || b[2] != b':' || !b[..2].iter().chain(&b[3..]).all(u8::is_ascii_digit) {
+        return None;
+    }
+    let (h, m) = (
+        u32::from(b[0] - b'0') * 10 + u32::from(b[1] - b'0'),
+        u32::from(b[3] - b'0') * 10 + u32::from(b[4] - b'0'),
+    );
+    (h < 24 && m < 60).then_some(h * 60 + m)
 }
 
 /// Whether `ts` falls inside `window`, evaluated in the window's own timezone.
@@ -48,11 +60,11 @@ fn timestamp_in_window(ts: &DateTime<Utc>, window: &TimeWindow) -> bool {
     {
         return false;
     }
-    let (Some((sh, sm)), Some((eh, em))) = (parse_hm(&window.start), parse_hm(&window.end)) else {
+    let (Some(start), Some(end)) = (parse_hm(&window.start), parse_hm(&window.end)) else {
         return false;
     };
     let minute_of_day = local.hour() * 60 + local.minute();
-    minute_of_day >= sh * 60 + sm && minute_of_day <= eh * 60 + em
+    minute_of_day >= start && minute_of_day <= end
 }
 
 /// Step-by-step per spec/scope-matching.md `matches(scope, request, now)`.
@@ -157,6 +169,11 @@ pub fn narrows(parent: &Scope, child: &Scope) -> bool {
                     && cmax.value <= pmax.value => {}
             _ => return false,
         }
+    } else if child.max_amount.is_some() {
+        // A parent without a ceiling allows no amounts at all (see
+        // `matches`, step 3), so any ceiling on the child would grant money
+        // the parent never did.
+        return false;
     }
 
     // 4. counterparties: child allow ⊆ parent allow; child deny ⊇ parent deny
@@ -198,12 +215,10 @@ pub fn narrows(parent: &Scope, child: &Scope) -> bool {
                         .all(|d| parent_window.days.contains(d))
                     && parse_hm(&child_window.start)
                         .zip(parse_hm(&parent_window.start))
-                        .map(|(c, p)| c >= p)
-                        .unwrap_or(false)
+                        .is_some_and(|(c, p)| c >= p)
                     && parse_hm(&child_window.end)
                         .zip(parse_hm(&parent_window.end))
-                        .map(|(c, p)| c <= p)
-                        .unwrap_or(false)
+                        .is_some_and(|(c, p)| c <= p)
             });
             if !contained {
                 return false;
@@ -488,5 +503,105 @@ mod tests {
         // ...but the Verifier is evaluating on Sunday 2024-01-07, 15:00 Vienna time.
         let sunday = Utc.with_ymd_and_hms(2024, 1, 7, 14, 0, 0).unwrap();
         assert!(!matches(&scope, &req, sunday));
+    }
+
+    fn eur(value: f64) -> Amount {
+        Amount {
+            value,
+            currency: "EUR".into(),
+        }
+    }
+
+    #[test]
+    fn narrows_rejects_a_ceiling_the_parent_never_granted() {
+        // The parent allows no amounts at all (`matches` step 3). A child
+        // ceiling, however small, would let money through.
+        let parent = base_scope();
+        let child = Scope {
+            actions: vec!["create_payment".into()],
+            max_amount: Some(eur(1_000_000_000.0)),
+            ..Default::default()
+        };
+        assert!(!narrows(&parent, &child));
+
+        let mut req = base_request();
+        req.amount = Some(eur(999_999_999.0));
+        assert!(!matches(&parent, &req, Utc::now()));
+    }
+
+    #[test]
+    fn narrows_still_accepts_a_child_without_a_ceiling_under_a_parent_without_one() {
+        let parent = base_scope();
+        let child = Scope {
+            actions: vec!["read_invoice".into()],
+            ..Default::default()
+        };
+        assert!(narrows(&parent, &child));
+    }
+
+    #[test]
+    fn parse_hm_accepts_only_strict_24_hour_times() {
+        assert_eq!(parse_hm("00:00"), Some(0));
+        assert_eq!(parse_hm("09:30"), Some(570));
+        assert_eq!(parse_hm("23:59"), Some(1439));
+        for bad in [
+            "9:00",
+            "09:0",
+            "24:00",
+            "23:60",
+            "16:120",
+            "00:1439",
+            "+1:00",
+            "1:000",
+            "09-00",
+            " 09:00",
+            "09:00 ",
+            "",
+            "٠٩:٠٠",
+        ] {
+            assert_eq!(parse_hm(bad), None, "{bad:?} must not parse");
+        }
+    }
+
+    fn all_days_utc(start: &str, end: &str) -> TimeWindow {
+        TimeWindow {
+            days: vec![
+                Weekday::Mon,
+                Weekday::Tue,
+                Weekday::Wed,
+                Weekday::Thu,
+                Weekday::Fri,
+                Weekday::Sat,
+                Weekday::Sun,
+            ],
+            start: start.into(),
+            end: end.into(),
+            timezone: "UTC".into(),
+        }
+    }
+
+    #[test]
+    fn narrows_rejects_out_of_range_minutes_that_stretch_a_window() {
+        // Compared as (hour, minute) tuples, (0, 1439) <= (1, 0) held, yet the
+        // child window covered the whole day.
+        let mut parent = base_scope();
+        parent.time_windows = Some(vec![all_days_utc("00:00", "01:00")]);
+        let mut child = base_scope();
+        child.time_windows = Some(vec![all_days_utc("00:00", "00:1439")]);
+        assert!(!narrows(&parent, &child));
+    }
+
+    #[test]
+    fn malformed_window_never_matches() {
+        let req = base_request();
+        let morning = Utc.with_ymd_and_hms(2024, 1, 8, 8, 26, 0).unwrap();
+        for (start, end) in [("00:00", "00:1439"), ("08:00", "24:00"), ("8:00", "09:00")] {
+            let mut scope = base_scope();
+            scope.time_windows = Some(vec![all_days_utc(start, end)]);
+            assert!(!matches(&scope, &req, morning), "{start}-{end}");
+        }
+        let mut scope = base_scope();
+        scope.time_windows = Some(vec![all_days_utc("08:00", "09:00")]);
+        assert!(matches(&scope, &req, morning));
     }
 }

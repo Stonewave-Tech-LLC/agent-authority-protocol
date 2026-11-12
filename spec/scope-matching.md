@@ -26,12 +26,14 @@ Used when validating a sub-delegation (`can_delegate: true` on the parent). A ch
 
 1. `child.actions` ⊆ `parent.actions`.
 2. If `parent.resources` is set, `child.resources` must be set and be a subset of it. (A child may not go from bounded to unbounded.)
-3. If `parent.max_amount` is set: `child.max_amount` must be set, same currency, finite and non-negative, `child.value <= parent.value`.
+3. If `parent.max_amount` is set: `child.max_amount` must be set, same currency, finite and non-negative, `child.value <= parent.value`. If `parent.max_amount` is **not** set, `child.max_amount` must not be set either: a scope without a ceiling allows no amounts at all (`matches`, step 3), so any child ceiling would grant money the parent never did.
 4. `child.counterparties.allow` (if any) ⊆ `parent.counterparties.allow` (if any parent allow-list exists). `child.counterparties.deny` ⊇ `parent.counterparties.deny` (child may add denials, never remove them).
 5. `child.data_categories` (if any) ⊆ `parent.data_categories` (if any parent list exists).
-6. `child.time_windows` must be fully contained within the union of `parent.time_windows`, if the parent restricted time at all.
+6. `child.time_windows` must be fully contained within the union of `parent.time_windows`, if the parent restricted time at all. Times are compared as minutes since midnight. `start` and `end` must be strict 24-hour `HH:MM` (`00:00`–`23:59`); anything else (`9:00`, `16:120`, `24:00`) makes the window invalid, in `narrows` and in `matches`.
 
 If any check fails, the sub-delegation is invalid at issuance time — a Verifier that receives it MUST reject the entire chain, not just the offending action.
+
+`narrows` is not the only line of defence. A Verifier also evaluates `matches` against the scope of **every** link in the chain, not only the leaf (`docs/verification-flow.md`, step 8). A bug in `narrows` therefore cannot widen what the principal granted at the root.
 
 ## Why pure functions
 

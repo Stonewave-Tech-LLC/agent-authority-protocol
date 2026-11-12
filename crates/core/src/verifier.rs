@@ -230,7 +230,15 @@ impl<'a, R: KeyResolver, S: StatusChecker, N: NonceStore, SG: Signer> Verifier<'
             return Err(VerificationFailure::NonceReplayed);
         }
 
-        if !scope::matches(&leaf.scope, &verified_msg.payload.request, now) {
+        // Cumulative evaluation: the request must fit the scope of every link,
+        // not only the leaf's. With a correct `narrows` this changes nothing,
+        // since whatever the leaf allows its ancestors allow too. It means a
+        // bug in `narrows` can no longer widen authority: the principal's own
+        // scope at the root is always checked against the actual request.
+        if !verified_payloads
+            .iter()
+            .all(|link| scope::matches(&link.scope, &verified_msg.payload.request, now))
+        {
             return Err(VerificationFailure::ScopeDenied);
         }
 
