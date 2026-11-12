@@ -126,6 +126,8 @@ pub enum Reason {
     StatusUnavailable { position: Position, message: String },
     #[error("{position}: no status entry and valid for too long to go unrevocable")]
     Unrevocable { position: Position },
+    #[error("{position}: a claim at {pointer:?} is not disclosed and could be a restriction")]
+    HiddenClaim { position: Position, pointer: String },
     #[error("more open mandates than this verifier accepts")]
     TooManyMandates,
     #[error("{position}: {further} further open mandate(s), but max_depth is {max_depth}")]
@@ -189,6 +191,7 @@ impl Reason {
             | Reason::Revoked { .. }
             | Reason::StatusUnavailable { .. }
             | Reason::Unrevocable { .. }
+            | Reason::HiddenClaim { .. }
             | Reason::Freshness(_)
             | Reason::Replay
             | Reason::NonceStore(_) => InvalidCredential,
@@ -409,6 +412,17 @@ impl<'a> Verifier<'a> {
                 if !claim("vct").is_some_and(|v| vct.iter().any(|x| x == v)) {
                     return Err(Reason::RootNotAccepted);
                 }
+                // A credential may conceal personal data, but if it carries
+                // no visible `status`, a hidden top-level claim could be the
+                // status entry the holder chose not to show.
+                if !root.claims().contains_key("status")
+                    && root.undisclosed().iter().any(|p| p.is_empty())
+                {
+                    return Err(Reason::HiddenClaim {
+                        position: root.position(),
+                        pointer: String::new(),
+                    });
+                }
                 let principal = Principal::Credential {
                     issuer: claim("iss").map(str::to_owned),
                     user_key: root.cnf().cloned(),
@@ -435,6 +449,16 @@ impl<'a> Verifier<'a> {
         })?;
         let mut mandates = Vec::with_capacity(opens.len());
         for link in opens {
+            // V1b: the agent holds every open mandate's disclosures and picks
+            // which to present. `claims()` alone cannot tell a constraint it
+            // left out from one the user never set, so only hiding that can
+            // narrow the mandate is allowed.
+            if let Some(pointer) = link.undisclosed().iter().find(|p| !hiding_only_narrows(p)) {
+                return Err(Reason::HiddenClaim {
+                    position: link.position(),
+                    pointer: pointer.clone(),
+                });
+            }
             let open = OpenMandate::parse(link.claims(), ledger_key(link)).map_err(|error| {
                 Reason::Mandate {
                     position: link.position(),
@@ -550,6 +574,24 @@ impl<'a> Verifier<'a> {
             return Err(Reason::Freshness("iat outside the freshness window"));
         }
         Ok(iat as i64)
+    }
+}
+
+/// Whether leaving out elements of the array at `pointer` (relative to an
+/// open mandate's claims) can only make the mandate narrower: the members
+/// of an allow-list (`allowed`, `allow`), the alternative time `windows`,
+/// and the `acceptable_items` of a line item. Every constraint array is
+/// non-empty by schema, so hiding all of them fails closed. Anywhere else,
+/// a hidden claim could be a limit (an `amount_range`, a `deny` entry, a
+/// `budget`, a pre-set `payee`), so it is rejected. Issuers must therefore
+/// put decoy digests only into these arrays.
+fn hiding_only_narrows(pointer: &str) -> bool {
+    let segments: Vec<&str> = pointer.split('/').skip(1).collect();
+    let index = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    match segments.as_slice() {
+        ["constraints", i, "allowed" | "allow" | "windows"] => index(i),
+        ["constraints", i, "items", j, "acceptable_items"] => index(i) && index(j),
+        _ => false,
     }
 }
 

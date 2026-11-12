@@ -33,6 +33,7 @@ use crate::error::{Error, ErrorKind, Position};
 use crate::hash::SdAlg;
 use crate::jws::{Jws, Object};
 use crate::keys::VerifyingKey;
+use crate::pointer::{to_pointer, Path, Segment};
 use crate::presentation::Presentation;
 use crate::process::{element_digest, process};
 use crate::sdjwt::SdJwt;
@@ -172,6 +173,7 @@ pub struct VerifiedLink {
     cnf: Option<VerifyingKey>,
     sd_alg: SdAlg,
     sd_jwt: String,
+    undisclosed: Vec<String>,
 }
 
 impl VerifiedLink {
@@ -215,6 +217,36 @@ impl VerifiedLink {
     pub fn sd_jwt(&self) -> &str {
         &self.sd_jwt
     }
+
+    /// Where something may be missing from [`claims`](Self::claims): a JSON
+    /// Pointer (relative to `claims`, `""` for the top level) to every
+    /// object or array that held a digest no presented disclosure matched,
+    /// one entry per such digest.
+    ///
+    /// RFC 9901 lets the holder leave out any concealed claim, and a
+    /// left-out claim looks exactly like a decoy. So `claims` alone cannot
+    /// tell "the issuer set no limit here" from "the holder hid the limit".
+    /// Policy code that treats a missing claim as "unrestricted" must check
+    /// this list first. The undisclosed siblings of a link's Delegate
+    /// Payload are expected and not listed.
+    pub fn undisclosed(&self) -> &[String] {
+        &self.undisclosed
+    }
+}
+
+/// The undisclosed locations of a processed element, relative to the claims
+/// a [`VerifiedLink`] exposes: all of them for a credential root; for a
+/// Delegate Payload element only those inside the one disclosed payload
+/// (which is element 0 of `delegate_payload` once processed).
+fn undisclosed_in_claims(undisclosed: &[Path], in_delegate_payload: bool) -> Vec<String> {
+    if !in_delegate_payload {
+        return undisclosed.iter().map(|p| to_pointer(p)).collect();
+    }
+    let prefix = [Segment::Key("delegate_payload".into()), Segment::Index(0)];
+    undisclosed
+        .iter()
+        .filter_map(|p| p.strip_prefix(&prefix[..]).map(to_pointer))
+        .collect()
 }
 
 /// The final KB-JWT, verified.
@@ -350,7 +382,12 @@ fn verify_root(
     root.jws().check_typ(&allowed)?;
     root.jws().verify(issuer_key)?;
     let sd_alg = SdAlg::of_payload(root.jws().payload())?;
-    let processed = process(root.jws().payload(), root.disclosures(), sd_alg)?.claims;
+    let processed = process(root.jws().payload(), root.disclosures(), sd_alg)?;
+    let undisclosed = undisclosed_in_claims(
+        &processed.undisclosed,
+        opts.root_form == RootForm::DelegatePayload,
+    );
+    let processed = processed.claims;
     let (claims, envelope) = match opts.root_form {
         RootForm::Credential => (processed, Object::new()),
         RootForm::DelegatePayload => {
@@ -372,6 +409,7 @@ fn verify_root(
         cnf,
         sd_alg,
         sd_jwt: root.serialize(),
+        undisclosed,
     })
 }
 
@@ -406,7 +444,9 @@ fn verify_link(
 
     check_raw_delegate_payload(payload)?;
     let sd_alg = SdAlg::of_payload(payload)?;
-    let mut envelope = process(payload, element.disclosures(), sd_alg)?.claims;
+    let processed = process(payload, element.disclosures(), sd_alg)?;
+    let undisclosed = undisclosed_in_claims(&processed.undisclosed, true);
+    let mut envelope = processed.claims;
     let claims = take_delegate_payload(&mut envelope)?;
 
     let kind = if jws.check_typ(&[typ::KB_SD_JWT]).is_ok() {
@@ -452,6 +492,7 @@ fn verify_link(
         cnf,
         sd_alg,
         sd_jwt: element.serialize(),
+        undisclosed,
     })
 }
 
