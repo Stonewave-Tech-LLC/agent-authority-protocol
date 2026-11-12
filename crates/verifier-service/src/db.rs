@@ -57,24 +57,31 @@ pub async fn registry_with_principal_key(
     Ok(registry)
 }
 
-/// Looks up revocation status for every delegation_id in the presented
-/// chain and returns an `InMemoryStatus` with the revoked ones marked.
+/// Looks up revocation status for every delegation in the presented chain
+/// and returns an `InMemoryStatus` with the revoked ones marked.
 /// Fails closed: a delegation_id this service has never heard of is
 /// treated as revoked (`.revoke()`d) — "unknown" must never silently pass
 /// as "valid".
+///
+/// The row must also belong to the presented token: a sub-delegating agent
+/// chooses its child's `delegation_id`, so it could copy the id of any
+/// other registered delegation (a sibling, say). The child would then
+/// borrow that row's revocation status and could never be revoked on its
+/// own. So a row whose stored `delegation_jws` is not the presented JWS
+/// counts as unknown, which is revoked.
 pub async fn status_for_chain(
     pool: &Pool,
-    delegation_ids: &[Uuid],
+    chain: &[(Uuid, &str)],
 ) -> Result<InMemoryStatus, String> {
     let status = InMemoryStatus::new();
     let client = pool
         .get()
         .await
         .map_err(|e| format!("db pool error: {e}"))?;
-    for id in delegation_ids {
+    for (id, presented_jws) in chain {
         let row = client
             .query_opt(
-                "select revoked_at from aap_delegations where delegation_id = $1",
+                "select revoked_at, delegation_jws from aap_delegations where delegation_id = $1",
                 &[id],
             )
             .await
@@ -82,7 +89,8 @@ pub async fn status_for_chain(
         let revoked = match row {
             Some(r) => {
                 let revoked_at: Option<chrono::DateTime<chrono::Utc>> = r.get(0);
-                revoked_at.is_some()
+                let stored_jws: Option<String> = r.get(1);
+                revoked_at.is_some() || !row_belongs_to(stored_jws.as_deref(), presented_jws)
             }
             None => true, // never issued / unknown -> fail closed
         };
@@ -91,6 +99,12 @@ pub async fn status_for_chain(
         }
     }
     Ok(status)
+}
+
+/// Whether a stored delegation row is the record of the presented token.
+/// A row without a stored JWS cannot be tied to any token: fail closed.
+pub fn row_belongs_to(stored_jws: Option<&str>, presented_jws: &str) -> bool {
+    stored_jws == Some(presented_jws)
 }
 
 /// Atomically checks-and-records (agent_id, nonce) against aap_nonces
@@ -227,4 +241,17 @@ pub async fn persist_receipt(
         .await
         .map_err(|e| format!("failed to persist receipt: {e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::row_belongs_to;
+
+    #[test]
+    fn a_row_only_vouches_for_its_own_token() {
+        assert!(row_belongs_to(Some("a.b.c"), "a.b.c"));
+        // A child that copied a sibling's delegation_id presents another JWS.
+        assert!(!row_belongs_to(Some("a.b.c"), "x.y.z"));
+        assert!(!row_belongs_to(None, "a.b.c"));
+    }
 }

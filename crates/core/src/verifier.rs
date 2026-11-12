@@ -54,6 +54,9 @@ pub struct Verifier<'a, R: KeyResolver, S: StatusChecker, N: NonceStore, SG: Sig
 pub const DEFAULT_MAX_MESSAGE_AGE_SECS: i64 = 300;
 /// How far an agent's clock may run ahead of the Verifier's.
 pub const DEFAULT_MAX_CLOCK_SKEW_SECS: i64 = 60;
+/// The longest delegation chain a Verifier looks at, root included. A
+/// chain's own `max_delegation_depth` can only make this shorter.
+pub const MAX_CHAIN_LENGTH: usize = 8;
 
 impl<'a, R: KeyResolver, S: StatusChecker, N: NonceStore, SG: Signer> Verifier<'a, R, S, N, SG> {
     pub fn new(
@@ -121,6 +124,11 @@ impl<'a, R: KeyResolver, S: StatusChecker, N: NonceStore, SG: Signer> Verifier<'
         if delegation_chain_jws.is_empty() {
             return Err(VerificationFailure::ChainBroken("empty chain".into()));
         }
+        // Before any parsing, signature check or registry lookup: an agent
+        // controls the length of what it sends.
+        if delegation_chain_jws.len() > MAX_CHAIN_LENGTH {
+            return Err(VerificationFailure::ChainTooDeep);
+        }
 
         let mut verified_payloads: Vec<Delegation> = Vec::with_capacity(delegation_chain_jws.len());
 
@@ -159,6 +167,28 @@ impl<'a, R: KeyResolver, S: StatusChecker, N: NonceStore, SG: Signer> Verifier<'
             }
 
             verified_payloads.push(verified.payload);
+        }
+
+        // The root is the root: it names no parent.
+        if verified_payloads
+            .last()
+            .is_some_and(|root| root.parent_delegation_id.is_some())
+        {
+            return Err(VerificationFailure::ChainBroken(
+                "the root delegation names a parent".into(),
+            ));
+        }
+        // Every link has its own id. A sub-delegation reusing its parent's id
+        // would share the parent's revocation status, so it could be neither
+        // revoked separately nor told apart from the parent in a receipt.
+        let mut ids = std::collections::HashSet::with_capacity(verified_payloads.len());
+        if !verified_payloads
+            .iter()
+            .all(|d| ids.insert(d.delegation_id))
+        {
+            return Err(VerificationFailure::ChainBroken(
+                "two links share a delegation_id".into(),
+            ));
         }
 
         // Chain integrity: parent linkage, can_delegate, depth, scope narrowing.

@@ -837,3 +837,96 @@ fn rejects_sub_delegation_whose_window_uses_out_of_range_minutes() {
         outcome.decision.err()
     );
 }
+
+/// Review 2026-11, finding M2: a sub-delegation that reuses its parent's
+/// `delegation_id` would share the parent's revocation status.
+#[test]
+fn rejects_sub_delegation_that_reuses_its_parents_id() {
+    let f = setup();
+    let sub_agent = LocalSigner::generate();
+    let root = delegation::issue(
+        &f.principal_signer,
+        delegation_params(&f, payment_scope(500.0)),
+    )
+    .unwrap();
+    let mut child = delegation::issue(&f.agent_signer, sub_delegation_params(&sub_agent, &root))
+        .unwrap()
+        .payload;
+    child.delegation_id = root.payload.delegation_id;
+    child.parent_delegation_id = Some(root.payload.delegation_id);
+    let child_jws = f.agent_signer.sign_payload(&child).unwrap();
+    let msg = message::issue(
+        &sub_agent,
+        "agent:wave-1-sub",
+        "bank-api",
+        payment_request(50.0),
+    )
+    .unwrap();
+
+    let outcome = verifier(&f).verify(&[&child_jws, &root.jws], &msg.jws);
+
+    match outcome.decision {
+        Err(VerificationFailure::ChainBroken(reason)) => {
+            assert!(reason.contains("share a delegation_id"), "{reason}")
+        }
+        other => panic!("expected ChainBroken, got {:?}", other.err()),
+    }
+}
+
+#[test]
+fn rejects_a_root_that_names_a_parent() {
+    let f = setup();
+    let mut params = delegation_params(&f, payment_scope(500.0));
+    params.parent_delegation_id = Some(uuid::Uuid::new_v4());
+    let root = delegation::issue(&f.principal_signer, params).unwrap();
+    let msg = message::issue(
+        &f.agent_signer,
+        "agent:wave-1",
+        "bank-api",
+        payment_request(50.0),
+    )
+    .unwrap();
+
+    let outcome = verifier(&f).verify(&[&root.jws], &msg.jws);
+
+    match outcome.decision {
+        Err(VerificationFailure::ChainBroken(reason)) => {
+            assert!(reason.contains("names a parent"), "{reason}")
+        }
+        other => panic!("expected ChainBroken, got {:?}", other.err()),
+    }
+}
+
+#[test]
+fn rejects_an_overlong_chain_before_looking_at_it() {
+    let f = setup();
+    let msg = message::issue(
+        &f.agent_signer,
+        "agent:wave-1",
+        "bank-api",
+        payment_request(50.0),
+    )
+    .unwrap();
+    let junk = vec!["not-a-jws"; aap_core::verifier::MAX_CHAIN_LENGTH + 1];
+
+    let outcome = verifier(&f).verify(&junk, &msg.jws);
+
+    assert!(matches!(
+        outcome.decision,
+        Err(VerificationFailure::ChainTooDeep)
+    ));
+}
+
+/// Review 2026-11, finding M1: with the identity point as agent key and
+/// plain `verify`, the signature (R = identity, s = 0) verified for every
+/// message.
+#[test]
+fn rejects_a_weak_ed25519_agent_key() {
+    let mut identity = [0u8; 32];
+    identity[0] = 1;
+    let jwk = aap_core::PublicKeyJwk {
+        x: base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, identity),
+        ..LocalSigner::generate().public_jwk()
+    };
+    assert!(aap_core::jws::jwk_to_public_key(&jwk).is_err());
+}

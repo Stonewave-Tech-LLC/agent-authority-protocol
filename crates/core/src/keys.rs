@@ -75,7 +75,9 @@ impl VerifyingKey {
                     return false;
                 };
                 let sig = Ed25519Signature::from_bytes(&sig_array);
-                k.verify(msg, &sig).is_ok()
+                // Strict: rejects small-order R and non-canonical encodings,
+                // which plain `verify` lets through for weak keys.
+                k.verify_strict(msg, &sig).is_ok()
             }
             VerifyingKey::P256(k) => {
                 let Ok(sig) = P256Signature::from_slice(sig_bytes) else {
