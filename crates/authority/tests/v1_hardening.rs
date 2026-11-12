@@ -177,3 +177,28 @@ fn a_past_execution_date_is_rejected() {
         .into_outcome()
         .is_ok());
 }
+
+#[test]
+fn the_leeway_does_not_extend_not_after() {
+    // The window closed four minutes before NOW. An execution date at the
+    // closing instant is within the five-minute leeway for "past", but it
+    // would run now, after the window: rejected.
+    let keys = Keys::new();
+    let closing = "2027-01-15T07:56:00+00:00"; // NOW - 240 s
+    let open = json!({"vct": "mandate.payment.open.1", "constraints": [
+        {"type": "payment.amount_range", "currency": "EUR", "max": 5000},
+        {"type": "payment.execution_date", "not_after": closing}]});
+    let mut closed = payment("shop", 100, "EUR");
+    closed["execution_date"] = json!(closing);
+    let chain = Chain::new(&keys, vec![open], closed);
+    let receipt = SigningKey::generate_p256();
+    let status = valid_status();
+    let v = Verifier::new(policy(), VERIFIER, &receipt, &status);
+    let rejected = run(&v, &keys, &chain.build(), &payment_tx())
+        .into_outcome()
+        .expect_err("execution after not_after");
+    assert!(
+        rejected.to_string().contains("after the allowed window"),
+        "{rejected}"
+    );
+}

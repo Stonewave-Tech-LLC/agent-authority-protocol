@@ -349,7 +349,10 @@ impl ExecutionDate {
         if self.not_before.is_some_and(|nb| start < nb) {
             return Err(violated("execution date is before the allowed window"));
         }
-        if self.not_after.is_some_and(|na| end > na) {
+        // The leeway only forgives a date written a moment ago; it never
+        // extends the window. Whatever the date says, execution happens
+        // now at the earliest, so `now` must also be inside `not_after`.
+        if self.not_after.is_some_and(|na| end.max(now) > na) {
             return Err(violated("execution date is after the allowed window"));
         }
         Ok(())
@@ -370,11 +373,11 @@ impl ExecutionDate {
     }
 }
 
-/// An RFC 3339 date-time is one instant; a bare `YYYY-MM-DD` date is the
-/// whole UTC day, first to last second.
 /// How far in the past an `execution_date` instant may lie, in seconds.
 const EXECUTION_DATE_LEEWAY: i64 = 300;
 
+/// An RFC 3339 date-time is one instant; a bare `YYYY-MM-DD` date is the
+/// whole UTC day, first to last second.
 fn instant_range(s: &str) -> Option<(i64, i64)> {
     if let Ok(t) = DateTime::parse_from_rfc3339(s) {
         let t = t.timestamp();
