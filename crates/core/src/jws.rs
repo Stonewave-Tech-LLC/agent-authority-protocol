@@ -118,6 +118,11 @@ pub fn jwk_to_public_key(jwk: &PublicKeyJwk) -> Result<VerifyingKey, JwsError> {
                 .map_err(|_| JwsError::BadKey("Ed25519 public key is not 32 bytes".into()))?;
             let key = ed25519_dalek::VerifyingKey::from_bytes(&array)
                 .map_err(|e| JwsError::BadKey(e.to_string()))?;
+            // A small-order ("weak") key, such as the identity point, has
+            // signatures anyone can forge for any message.
+            if key.is_weak() {
+                return Err(JwsError::BadKey("weak Ed25519 public key".into()));
+            }
             Ok(VerifyingKey::Ed25519(key))
         }
         ("EC", "P-256") => {
