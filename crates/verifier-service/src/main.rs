@@ -206,6 +206,17 @@ async fn verify(
             "delegation_chain_jws must not be empty".into(),
         ));
     }
+    // The verifier caps chains too, but only after the prefetch below has
+    // parsed every link and made one Postgres query per link. Cap first.
+    if req.delegation_chain_jws.len() > aap_core::verifier::MAX_CHAIN_LENGTH {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "delegation_chain_jws has more than {} links",
+                aap_core::verifier::MAX_CHAIN_LENGTH
+            ),
+        ));
+    }
 
     // Peek at the UNVERIFIED payloads purely to know what to prefetch from
     // Postgres. Never used for any trust decision — that happens only
@@ -216,15 +227,19 @@ async fn verify(
     let unverified_chain: Vec<_> = req
         .delegation_chain_jws
         .iter()
-        .filter_map(|jws| DelegationToken::from_jws(jws).ok())
+        .filter_map(|jws| {
+            DelegationToken::from_jws(jws)
+                .ok()
+                .map(|t| (t, jws.as_str()))
+        })
         .collect();
-    let delegation_ids: Vec<Uuid> = unverified_chain
+    let delegations: Vec<(Uuid, &str)> = unverified_chain
         .iter()
-        .map(|t| t.payload.delegation_id)
+        .map(|(t, jws)| (t.payload.delegation_id, *jws))
         .collect();
     let root_principal_id = unverified_chain
         .last()
-        .map(|t| t.payload.principal_id.clone());
+        .map(|(t, _)| t.payload.principal_id.clone());
 
     let registry = match &root_principal_id {
         Some(pid) => db::registry_with_principal_key(&state.pool, pid)
@@ -232,7 +247,7 @@ async fn verify(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?,
         None => aap_core::InMemoryRegistry::new(),
     };
-    let status = db::status_for_chain(&state.pool, &delegation_ids)
+    let status = db::status_for_chain(&state.pool, &delegations)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -422,5 +437,28 @@ mod tests {
                 "{path} with missing fields"
             );
         }
+    }
+
+    /// The test pool points nowhere, so a request that reached the
+    /// per-link Postgres prefetch would come back 500, not 400.
+    #[tokio::test]
+    async fn an_overlong_chain_is_refused_before_any_database_work() {
+        let links = vec!["x.y.z"; aap_core::verifier::MAX_CHAIN_LENGTH + 1];
+        let body = serde_json::json!({
+            "delegation_chain_jws": links,
+            "agent_message_jws": "x.y.z",
+        })
+        .to_string();
+        let response = router(test_state())
+            .oneshot(
+                Request::post("/verify")
+                    .header("content-type", "application/json")
+                    .header("x-verifier-secret", SECRET)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }
